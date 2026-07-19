@@ -37,6 +37,7 @@ void RunFastScheduler()
    EvaluateAutomaticBE();
    EvaluateAllTrailingStops();
    EvaluateBasketWorstClose();
+   
 }
 
 void RunSlowScheduler()
@@ -58,6 +59,7 @@ void RunSlowScheduler()
 
    UpdatePanelShell(false);
    ProcessExternalMonitoring();
+   ProcessDeferredBreakevenJournals();
 
    // Stage 7 will process the non-blocking n8n journal queue here.
 }

@@ -27,6 +27,7 @@ void JournalManagedTradeEvent(const int index,const string event_name,const stri
 void InitializeRuntimeState()
 {
    ArrayResize(g_TradeStates,0);
+   ArrayResize(g_DeferredBEJournals, 0);
    g_HasManagedTrades = false;
    g_PanelDirty = true;
    g_RegistryDirty = false;

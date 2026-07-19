@@ -306,7 +306,82 @@ void JournalPartialConfirmed(const int index,
                           "");
 }
 
-void JournalBreakevenConfirmed(const int index,const double be_price)
+void QueueBreakevenJournal(const int index,const double be_price,const string source)
+{
+   if(!InpTradeJournalLogBreakeven)
+      return;
+
+   if(index < 0 || index >= ArraySize(g_TradeStates))
+      return;
+
+   if(!InpEnableTradeJournalCsv && !InpEnableN8nWebhook)
+      return;
+
+   int delay = InpBEJournalDelaySeconds;
+   if(delay < 0)
+      delay = 0;
+
+   // delay==0 → send immediately (old behaviour)
+   if(delay == 0)
+   {
+      JournalBreakevenConfirmedNow(index,be_price,source);
+      return;
+   }
+
+   ulong ticket = g_TradeStates[index].ticket;
+
+   // Update existing deferred row for same ticket
+   for(int i=0; i<ArraySize(g_DeferredBEJournals); i++)
+   {
+      if(!g_DeferredBEJournals[i].active)
+         continue;
+      if(g_DeferredBEJournals[i].ticket != ticket)
+         continue;
+
+      g_DeferredBEJournals[i].due_time    = TimeCurrent() + delay;
+      g_DeferredBEJournals[i].state_index = index;
+      g_DeferredBEJournals[i].be_price    = be_price;
+      g_DeferredBEJournals[i].source      = source;
+      LogDebug("JOURNAL","BE journal re-queued ticket #"+ (string)ticket +
+               " in "+IntegerToString(delay)+"s");
+      return;
+   }
+
+   // Reuse free slot or append
+   int slot = -1;
+   for(int j=0; j<ArraySize(g_DeferredBEJournals); j++)
+   {
+      if(!g_DeferredBEJournals[j].active)
+      {
+         slot = j;
+         break;
+      }
+   }
+
+   if(slot < 0)
+   {
+      if(ArraySize(g_DeferredBEJournals) >= ATP_MAX_DEFERRED_BE)
+      {
+         // oldest active → send now to avoid drop
+         JournalBreakevenConfirmedNow(index,be_price,source);
+         return;
+      }
+      slot = ArraySize(g_DeferredBEJournals);
+      ArrayResize(g_DeferredBEJournals,slot+1);
+   }
+
+   g_DeferredBEJournals[slot].active      = true;
+   g_DeferredBEJournals[slot].due_time    = TimeCurrent() + delay;
+   g_DeferredBEJournals[slot].ticket      = ticket;
+   g_DeferredBEJournals[slot].state_index = index;
+   g_DeferredBEJournals[slot].be_price    = be_price;
+   g_DeferredBEJournals[slot].source      = source;
+
+   LogDebug("JOURNAL","BE journal queued ticket #"+ (string)ticket +
+            " delay="+IntegerToString(delay)+"s");
+}
+
+void JournalBreakevenConfirmedNow(const int index,const double be_price,const string source)
 {
    if(!InpTradeJournalLogBreakeven)
       return;
@@ -321,7 +396,7 @@ void JournalBreakevenConfirmed(const int index,const double be_price)
    if(SymbolInfoTick(state.symbol,tick))
       current_price = (state.position_type == POSITION_TYPE_BUY ? tick.bid : tick.ask);
 
-   // BE is protection only — do not calculate or send P/L
+   // BE notification: no P/L (as agreed)
    WriteTradeJournalEvent("BREAKEVEN",
                           state.ticket,
                           state.symbol,
@@ -332,10 +407,62 @@ void JournalBreakevenConfirmed(const int index,const double be_price)
                           state.take_profit,
                           0.0,
                           "BE SL=" + DoubleToString(be_price,_Digits),
-                          "ENGINE",
+                          source,
                           "");
 }
 
+void ProcessDeferredBreakevenJournals()
+{
+   if(ArraySize(g_DeferredBEJournals) <= 0)
+      return;
+
+   datetime now = TimeCurrent();
+
+   for(int i=0; i<ArraySize(g_DeferredBEJournals); i++)
+   {
+      if(!g_DeferredBEJournals[i].active)
+         continue;
+
+      if(now < g_DeferredBEJournals[i].due_time)
+         continue;
+
+      ulong ticket = g_DeferredBEJournals[i].ticket;
+      double be_price = g_DeferredBEJournals[i].be_price;
+      string source = g_DeferredBEJournals[i].source;
+      if(StringLen(source) <= 0)
+         source = "ENGINE";
+
+      int index = FindTradeStateIndex(ticket);
+      if(index < 0)
+      {
+         // Position may already be closed — still emit BE event with stored ticket data
+         WriteTradeJournalEvent("BREAKEVEN",
+                                ticket,
+                                _Symbol,
+                                "UNKNOWN",
+                                0.0,
+                                0.0,
+                                be_price,
+                                0.0,
+                                0.0,
+                                "BE SL=" + DoubleToString(be_price,_Digits) + " (deferred, ticket gone)",
+                                source,
+                                "");
+      }
+      else
+      {
+         JournalBreakevenConfirmedNow(index,be_price,source);
+      }
+
+      g_DeferredBEJournals[i].active = false;
+   }
+}
+
+void JournalBreakevenConfirmed(const int index,const double be_price)
+{
+   // Default path: delay so PARTIAL CSV+webhook can finish first
+   QueueBreakevenJournal(index,be_price,"ENGINE");
+}
 void JournalTrailingStopConfirmed(const int index,const double trail_price)
 {
    if(!InpTradeJournalLogTrailingStop)

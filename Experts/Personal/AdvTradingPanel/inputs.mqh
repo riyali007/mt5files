@@ -70,6 +70,9 @@ input bool InpN8nSendTrailingStopEvents = true;
 input bool InpN8nSendCloseEvents = true;
 input bool InpN8nSendAdoptionEvents = true;
 
+input group "Breakeven Journal Delay"
+input int InpBEJournalDelaySeconds = 2;   // 0=immediate; 1-2 recommended so PARTIAL webhook finishes first
+
 input group "Trade Open Screenshot"
 input bool InpCaptureScreenshotOnTradeOpen = true;
 input int InpTradeOpenScreenshotWidth = 1600;
