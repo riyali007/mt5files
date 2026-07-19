@@ -100,6 +100,7 @@ bool SendBERequest(const int index,const string source)
       g_TradeStates[index].be_applied = true;
       PersistTradeState(index);
       JournalBreakevenConfirmed(index,state.stop_loss);
+      SoundOnBreakevenSet();
    
       LogInfo("BE","Ticket #" + (string)state.ticket + " already protected at/better than BE");
       return(true);
@@ -234,7 +235,8 @@ void ConfirmPendingBEActions()
       
          PersistTradeState(i);
          JournalBreakevenConfirmed(i,actual_sl);
-      
+         SoundOnBreakevenSet();
+         
          LogInfo("BE",
                  "Ticket #" + (string)ticket +
                  " confirmed at " + DoubleToString(actual_sl,_Digits) +

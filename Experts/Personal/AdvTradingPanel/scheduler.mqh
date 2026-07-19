@@ -36,8 +36,9 @@ void RunFastScheduler()
    EvaluateAllPartials();
    EvaluateAutomaticBE();
    EvaluateAllTrailingStops();
-   
+   EvaluateBasketWorstClose();
 }
+
 void RunSlowScheduler()
 {
    g_LastSlowRunMs = GetTickCount();
@@ -45,7 +46,14 @@ void RunSlowScheduler()
    if(g_RegistryDirty || (GetTickCount() - g_LastRegistryReconcileMs >= 1000))
    {
       g_RegistryDirty = false;
+      g_LastRegistryReconcileMs = GetTickCount();
       ReconcileManagedPositions("Timer");
+      SyncManagedStopsAndPartials();
+      ConfirmPendingPartialActions();
+      ConfirmPendingBEActions();
+      ConfirmPendingTrailingStopActions();
+      ConfirmPendingCloseActions();
+      RefreshAllManagedPositionVisuals();
    }
 
    UpdatePanelShell(false);

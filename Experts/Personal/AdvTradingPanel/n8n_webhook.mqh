@@ -32,6 +32,9 @@ bool IsN8nEventEnabled(const string event_name)
 
    if(event_name == "ADOPT")
       return(InpN8nSendAdoptionEvents);
+   
+   if(event_name == "SLTP_UPDATE")
+      return(InpN8nSendOpenEvents);
 
    return(false);
 }

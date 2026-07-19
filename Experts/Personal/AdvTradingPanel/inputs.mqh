@@ -76,4 +76,24 @@ input int InpTradeOpenScreenshotWidth = 1600;
 input int InpTradeOpenScreenshotHeight = 900;
 input bool InpIncludePanelInTradeOpenScreenshot = false;
 
+input group "Sounds"
+input bool   InpEnableSounds = true;
+input bool   InpSoundOnPartial = true;
+input bool   InpSoundOnBreakeven = true;
+input bool   InpSoundOnFullTP = true;
+input bool   InpSoundOnSLHit = true;
+// Built-in terminal sounds (MQL5\\Sounds) or your own .wav names
+input string InpSoundPartial = "ok.wav";
+input string InpSoundBreakeven = "news.wav";
+input string InpSoundFullTP = "alert2.wav";
+input string InpSoundSLHit = "timeout.wav";
+
+input group "Basket Worst-First Close"
+input bool InpEnableBasketWorstClose = true;           // Master switch
+input int  InpBasketMinGroupSize = 2;                  // Need at least N same-direction trades
+input int  InpBasketMinWorstProfitPoints = 50;          // Worst must be green by this many points
+input int  InpBasketCoverBufferPoints = 20;             // Extra good-side points beyond covering worst
+input bool InpBasketRequireCover = true;               // Option 2: green AND cover
+input bool InpBasketIncludeExternal = true;            // Include adopted/external managed tickets
+
 #endif
