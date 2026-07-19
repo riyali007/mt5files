@@ -108,6 +108,21 @@ struct TradePlan
    double reward_money;
 };
 
+// Deferred BREAKEVEN journal/webhook (avoid clashing with PARTIAL WebRequest)
+#define ATP_MAX_DEFERRED_BE 16
+
+struct DeferredBEJournal
+{
+   bool     active;
+   datetime due_time;
+   ulong    ticket;
+   int      state_index;   // may go stale; ticket is source of truth
+   double   be_price;
+   string   source;
+};
+
+DeferredBEJournal g_DeferredBEJournals[];
+
 TradeState g_TradeStates[];
 TradePlan g_CurrentPlan;
 
