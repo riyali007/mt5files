@@ -1,0 +1,79 @@
+#ifndef ADVTP_INPUTS_MQH
+#define ADVTP_INPUTS_MQH
+
+input group "General"
+input ulong InpMagicNumber = 26071801;
+input bool InpAllowOnlyHedgingAccounts = true;
+input int InpTimerIntervalMs = 250;
+input bool InpEnableDebugLog = true;
+
+input group "Panel"
+input ENUM_BASE_CORNER InpPanelCorner = CORNER_LEFT_UPPER;
+input int InpPanelX = 10;
+input int InpPanelY = 20;
+
+input group "Order Defaults"
+input double InpDefaultLot = 0.30;
+input int InpDefaultSLPoints = 700;
+input int InpDefaultTPPoints = 1500;
+input int InpDefaultPartialCount = 4;
+input int InpDeviationPoints = 20;
+
+input group "Partial Defaults"
+input double InpFirstPartialPercent = 30.0;
+input double InpSubsequentPartialPercent = 10.0;
+input double InpManualPartialDefaultPercent = 10.0;
+
+input group "Breakeven"
+input int InpBETriggerPartial = 1;
+input int InpBEOffsetPoints = 0;
+
+input group "Developer Test Mode"
+input bool InpShowDeveloperControls = false;
+input bool InpEnableDeveloperTestMode = false;
+
+input group "External Trade Monitoring"
+input bool InpMonitorExternal = true;
+input bool InpExternalAlerts = true;
+input bool InpAutoAdoptExternal = false;
+input bool InpAutoApplyDefaultSLTP = true;
+input bool InpOverwriteExternalSLTP = false;
+
+input group "Persistence"
+input bool InpRestoreManagedTradesOnInit = true;
+input bool InpPersistPartialState = true;
+
+input group "Trailing Stop"
+input bool InpEnableTrailingStop = false;
+input int InpTrailingStopStartPoints = 1000;
+input int InpTrailingStopDistancePoints = 500;
+input int InpTrailingStopStepPoints = 100;
+
+input group "Trade Journal CSV"
+input bool InpEnableTradeJournalCsv = true;
+input string InpTradeJournalCsvFileName = "AdvTradingPanel_Journal.csv";
+input bool InpTradeJournalCsvInCommonFolder = true;
+input bool InpTradeJournalLogPartials = true;
+input bool InpTradeJournalLogBreakeven = true;
+input bool InpTradeJournalLogTrailingStop = true;
+input bool InpTradeJournalLogClose = true;
+input bool InpTradeJournalLogAdoption = true;
+
+input group "n8n Trade Journal Webhook"
+input bool InpEnableN8nWebhook = false;
+input string InpN8nWebhookUrl = "";
+input int InpN8nWebhookTimeoutMs = 3000;
+input bool InpN8nSendOpenEvents = true;
+input bool InpN8nSendPartialEvents = true;
+input bool InpN8nSendBreakevenEvents = true;
+input bool InpN8nSendTrailingStopEvents = true;
+input bool InpN8nSendCloseEvents = true;
+input bool InpN8nSendAdoptionEvents = true;
+
+input group "Trade Open Screenshot"
+input bool InpCaptureScreenshotOnTradeOpen = true;
+input int InpTradeOpenScreenshotWidth = 1600;
+input int InpTradeOpenScreenshotHeight = 900;
+input bool InpIncludePanelInTradeOpenScreenshot = false;
+
+#endif
