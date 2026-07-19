@@ -128,6 +128,16 @@
       "path":"trade_screenshot.mqh",
       "compile":false,
       "relative_to_project":true
+    },
+    {
+      "path":"basket_manager.mqh",
+      "compile":false,
+      "relative_to_project":true
+    },
+    {
+      "path":"sound_manager.mqh",
+      "compile":false,
+      "relative_to_project":true
     }
   ]
 }

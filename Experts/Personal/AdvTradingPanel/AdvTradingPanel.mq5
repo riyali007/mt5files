@@ -5,6 +5,7 @@
 #include "inputs.mqh"
 #include "variables.mqh"
 #include "logger.mqh"
+#include "sound_manager.mqh"
 #include "account_functions.mqh"
 #include "trade_plan.mqh"
 #include "order_entry.mqh"
@@ -23,6 +24,7 @@
 #include "close_manager.mqh"
 #include "external_manager.mqh"
 #include "developer_test.mqh"
+#include "basket_manager.mqh"
 #include "scheduler.mqh"
 #include "panel_shell.mqh"
 

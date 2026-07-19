@@ -1,0 +1,14 @@
+# Ignore everything
+*
+
+# Allow directories to be scanned
+!*/
+
+# Keep .gitignore itself
+!.gitignore
+
+# Keep all Personal folders
+!**/Personal/
+
+# Keep mq4/mq5/mqh files inside Personal folders
+!**/Personal/**/*.mq*

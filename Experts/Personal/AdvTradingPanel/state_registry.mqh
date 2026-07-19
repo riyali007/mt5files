@@ -12,6 +12,8 @@ bool LoadPersistedTradeState(const ulong ticket,TradeState &state);
 void BuildPartialPlanFromEntryTP(TradeState &state);
 void ProcessExternalMonitoring();
 void ConfirmPendingTrailingStopActions();
+void SyncManagedStopsAndPartials();
+void JournalSLTPUpdate(const int index,const double old_sl,const double old_tp,const double new_sl,const double new_tp);
 void EvaluateAllTrailingStops();
 void JournalPartialConfirmed(const int index,const int partial_index,const double closed_volume,const double remaining_volume);
 void JournalBreakevenConfirmed(const int index,const double be_price);
@@ -138,44 +140,51 @@ void RemoveTradeStateAt(const int index)
    if(index < 0 || index >= total)
       return;
 
-   ulong ticket = g_TradeStates[index].ticket;
+   // Capture journal fields BEFORE shifting the array out
+   ulong  ticket       = g_TradeStates[index].ticket;
+   string close_side   = (g_TradeStates[index].position_type == POSITION_TYPE_BUY ? "BUY" : "SELL");
+   string close_symbol = g_TradeStates[index].symbol;
+   double close_volume = g_TradeStates[index].current_volume;
+   double close_price  = g_TradeStates[index].entry_price;
+   double close_sl     = g_TradeStates[index].stop_loss;
+   string close_note   = "Position closed";
 
-   for(int i=index; i<total-1; i++)
-      g_TradeStates[i] = g_TradeStates[i+1];
-   
-   string close_side = "UNKNOWN";
-   string close_symbol = _Symbol;
-   double close_volume = 0.0;
-   double close_price = 0.0;
-   
-   for(int rs=0; rs<ArraySize(g_TradeStates); rs++)
-   {
-      if(g_TradeStates[rs].ticket != ticket)
-         continue;
-   
-      close_side = (g_TradeStates[rs].position_type == POSITION_TYPE_BUY ? "BUY" : "SELL");
-      close_symbol = g_TradeStates[rs].symbol;
-      close_volume = g_TradeStates[rs].current_volume;
-      close_price = g_TradeStates[rs].entry_price;
-      break;
-   }
-   
+   if(g_TradeStates[index].be_applied)
+      close_note = "Position closed (BE/protected SL)";
+   else if(close_sl > 0.0)
+      close_note = "Position closed (SL/TP/broker)";
+
+      // Snapshot full state for close sound classification
+   TradeState close_state = g_TradeStates[index];
+
+   MqlTick close_tick;
+   double exit_price = close_state.entry_price;
+   if(SymbolInfoTick(close_state.symbol,close_tick))
+      exit_price = (close_state.position_type == POSITION_TYPE_BUY ? close_tick.bid : close_tick.ask);
+
    JournalCloseEvent(ticket,
                      close_symbol,
                      close_side,
                      close_volume,
                      close_price,
                      0.0,
-                     "Position removed from management",
-                     "RECONCILE");
-   
+                     close_note,
+                     "ENGINE_CLOSE");
+                     
+   SoundOnManagedClose(close_state,exit_price);
+
    DeletePersistedTradeState(ticket);
    DeletePositionVisuals(ticket);
-   
+
+   for(int i=index; i<total-1; i++)
+      g_TradeStates[i] = g_TradeStates[i+1];
+
    ArrayResize(g_TradeStates,total-1);
    g_PanelDirty = true;
+   RefreshManagedTradeFlags();
+   EnsureSelectedTicket();
 
-   LogInfo("REGISTRY", "Removed ticket #" + (string)ticket);
+   LogInfo("REGISTRY", "Removed ticket #" + (string)ticket + " (" + close_note + ")");
 }
 
 void RefreshTradeStateFromBroker(const int index)
@@ -213,20 +222,13 @@ void ReconcileManagedPositions(const string source)
       }
    }
 
-   // 2) Remove managed entries whose broker position is gone
+   // 2) Remove managed entries whose broker position is gone (journals SL/BE/TP closes)
    for(int i=ArraySize(g_TradeStates)-1; i>=0; i--)
    {
       ulong ticket = g_TradeStates[i].ticket;
 
       if(!PositionSelectByTicket(ticket))
-      {
-         DeletePersistedTradeState(ticket);
-         DeletePositionVisuals(ticket);
-         // remove array slot (use your existing RemoveTradeStateAt if present)
-         for(int j=i; j<ArraySize(g_TradeStates)-1; j++)
-            g_TradeStates[j] = g_TradeStates[j+1];
-         ArrayResize(g_TradeStates,ArraySize(g_TradeStates)-1);
-      }
+         RemoveTradeStateAt(i);
    }
 
    // 3) Register EA-magic positions on current symbol
@@ -292,7 +294,95 @@ void RefreshManagedTradeFlags()
 {
    g_HasManagedTrades = (ArraySize(g_TradeStates) > 0);
 }
+// Detect manual/broker SL/TP changes, rebuild remaining partial ladder, journal + redraw
+void SyncManagedStopsAndPartials()
+{
+   if(!g_HasManagedTrades)
+      return;
 
+   const double tol = _Point * 0.5;
+
+   for(int i=0; i<ArraySize(g_TradeStates); i++)
+   {
+      if(g_TradeStates[i].pending_action != ATP_ACTION_NONE)
+         continue;
+
+      if(!PositionSelectByTicket(g_TradeStates[i].ticket))
+         continue;
+
+      double live_sl  = PositionGetDouble(POSITION_SL);
+      double live_tp  = PositionGetDouble(POSITION_TP);
+      double live_vol = PositionGetDouble(POSITION_VOLUME);
+
+      double old_sl = g_TradeStates[i].stop_loss;
+      double old_tp = g_TradeStates[i].take_profit;
+
+      bool sl_changed = (MathAbs(live_sl - old_sl) > tol);
+      bool tp_changed = (MathAbs(live_tp - old_tp) > tol);
+
+      if(!sl_changed && !tp_changed)
+      {
+         g_TradeStates[i].current_volume = live_vol;
+         continue;
+      }
+
+      g_TradeStates[i].current_volume = live_vol;
+      g_TradeStates[i].stop_loss      = live_sl;
+      g_TradeStates[i].take_profit    = live_tp;
+      g_TradeStates[i].entry_price    = PositionGetDouble(POSITION_PRICE_OPEN);
+      g_TradeStates[i].position_type  = PositionGetInteger(POSITION_TYPE);
+
+      // Rebuild incomplete partial levels from new final TP (keep completed ones)
+      if(tp_changed)
+      {
+         if(live_tp <= 0.0)
+         {
+            for(int p=0; p<g_TradeStates[i].partial_count; p++)
+            {
+               if(!g_TradeStates[i].partial_done[p])
+                  g_TradeStates[i].partial_prices[p] = 0.0;
+            }
+         }
+         else
+         {
+            int direction = (g_TradeStates[i].position_type == POSITION_TYPE_BUY ? 1 : -1);
+            double total_distance = MathAbs(live_tp - g_TradeStates[i].entry_price);
+
+            if(g_TradeStates[i].partial_count <= 0)
+            {
+               g_TradeStates[i].partial_count = MathMax(1,MathMin(5,g_PlanPartialCount));
+               ArrayResize(g_TradeStates[i].partial_done,g_TradeStates[i].partial_count);
+               ArrayInitialize(g_TradeStates[i].partial_done,false);
+               ArrayResize(g_TradeStates[i].partial_prices,g_TradeStates[i].partial_count);
+            }
+
+            for(int p=0; p<g_TradeStates[i].partial_count; p++)
+            {
+               if(g_TradeStates[i].partial_done[p])
+                  continue;
+
+               double fraction = (double)(p+1) / (double)(g_TradeStates[i].partial_count+1);
+               g_TradeStates[i].partial_prices[p] = NormalizeDouble(
+                  g_TradeStates[i].entry_price + direction * total_distance * fraction,_Digits);
+            }
+         }
+      }
+
+      PersistTradeState(i);
+      DrawManagedPositionVisuals(i);
+      JournalSLTPUpdate(i,old_sl,old_tp,live_sl,live_tp);
+
+      g_PanelDirty = true;
+
+      LogInfo("SYNC",
+              "Ticket #" + (string)g_TradeStates[i].ticket +
+              " SL/TP updated. SL " + DoubleToString(old_sl,_Digits) +
+              "->" + DoubleToString(live_sl,_Digits) +
+              " TP " + DoubleToString(old_tp,_Digits) +
+              "->" + DoubleToString(live_tp,_Digits) +
+              (tp_changed ? " [partials rebuilt]" : ""));
+   }
+}
 void HandleTradeTransaction(const MqlTradeTransaction &trans,
                             const MqlTradeRequest &request,
                             const MqlTradeResult &result)
@@ -306,6 +396,7 @@ void HandleTradeTransaction(const MqlTradeTransaction &trans,
             " order=" + (string)trans.order);
 
    ReconcileManagedPositions("OnTradeTransaction");
+   SyncManagedStopsAndPartials();
    RefreshAllManagedPositionVisuals();
    ConfirmPendingPartialActions();
    ConfirmPendingBEActions();

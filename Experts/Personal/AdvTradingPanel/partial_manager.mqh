@@ -3,11 +3,31 @@
 
 bool IsPartialTriggerReached(const TradeState &state,const double target_price)
 {
+   if(target_price <= 0.0)
+      return(false);
+
+   // Prefer live tick for this position's symbol; fall back to chart g_Bid/g_Ask
+   double bid = g_Bid;
+   double ask = g_Ask;
+
+   MqlTick tick;
+   if(SymbolInfoTick(state.symbol,tick))
+   {
+      bid = tick.bid;
+      ask = tick.ask;
+   }
+
+   if(bid <= 0.0 || ask <= 0.0)
+      return(false);
+
+   // Trigger when midline of spread crosses the partial level
+   double mid = (bid + ask) * 0.5;
+
    if(state.position_type == POSITION_TYPE_BUY)
-      return(g_Bid >= target_price);
+      return(mid >= target_price);
 
    if(state.position_type == POSITION_TYPE_SELL)
-      return(g_Ask <= target_price);
+      return(mid <= target_price);
 
    return(false);
 }
@@ -220,14 +240,35 @@ void ConfirmPendingPartialActions()
          PersistTradeState(i);
          
          if(partial_index >= 0)
+         {
             JournalPartialConfirmed(i,partial_index,previous_volume-current_volume,current_volume);
+            SoundOnPartial();
+         }
          else
+         {
+            MqlTick man_tick;
+            double man_price = g_TradeStates[i].entry_price;
+            if(SymbolInfoTick(g_TradeStates[i].symbol,man_tick))
+               man_price = (g_TradeStates[i].position_type == POSITION_TYPE_BUY ? man_tick.bid : man_tick.ask);
+   
+            double closed_vol = previous_volume - current_volume;
+            double man_pnl = CalculateJournalProfit(g_TradeStates[i].symbol,
+                                                    g_TradeStates[i].position_type,
+                                                    closed_vol,
+                                                    g_TradeStates[i].entry_price,
+                                                    man_price);
+   
             JournalManagedTradeEvent(i,
                                      "PARTIAL",
-                                     "Manual partial closed=" + DoubleToString(previous_volume-current_volume,2) +
-                                     " remaining=" + DoubleToString(current_volume,2),
+                                     "Manual partial closed=" + DoubleToString(closed_vol,2) +
+                                     " remaining=" + DoubleToString(current_volume,2) +
+                                     " pnl=" + DoubleToString(man_pnl,2),
                                      "MANUAL",
-                                     previous_volume-current_volume);
+                                     closed_vol,
+                                     man_price,
+                                     man_pnl);
+             SoundOnPartial();
+         }
       }
    }
 }

@@ -294,6 +294,36 @@ void DrawPlanLine(const string name,const double price,const color clr,const str
    ObjectSetString(0,name,OBJPROP_TEXT,label);
 }
 
+void DrawPlanPreviewForSide(const ENUM_ORDER_TYPE direction,const string side_tag)
+{
+   string reason;
+   TradePlan plan;
+
+   if(!BuildTradePlan(direction,plan,reason))
+   {
+      LogDebug("PREVIEW", side_tag + " blocked: " + reason);
+      return;
+   }
+
+   // Distinct object names per side so BUY and SELL can coexist
+   string pfx = PLAN_PREFIX + side_tag + "_";
+
+   color entry_clr = (direction == ORDER_TYPE_BUY ? clrDodgerBlue : clrMediumPurple);
+   color sl_clr    = clrTomato;
+   color tp_clr    = (direction == ORDER_TYPE_BUY ? clrLimeGreen : clrSpringGreen);
+   color part_clr  = (direction == ORDER_TYPE_BUY ? clrGold : clrOrange);
+
+   DrawPlanLine(pfx+"Entry",plan.entry,entry_clr,side_tag+" ENTRY");
+   DrawPlanLine(pfx+"SL",plan.sl,sl_clr,side_tag+" SL");
+   DrawPlanLine(pfx+"TP",plan.tp,tp_clr,side_tag+" FINAL TP");
+
+   for(int i=0; i<plan.partial_count; i++)
+      DrawPlanLine(pfx+"P"+IntegerToString(i+1),
+                   plan.partial_prices[i],
+                   part_clr,
+                   side_tag+" TP"+IntegerToString(i+1));
+}
+
 void TogglePlanPreview()
 {
    if(g_PreviewVisible)
@@ -301,28 +331,40 @@ void TogglePlanPreview()
       DeletePlanObjects();
       g_PreviewVisible = false;
       SetPanelMessage("Preview hidden",clrSilver);
+      ChartRedraw(0);
       return;
    }
 
-   string reason;
-   TradePlan plan;
-
-   if(!BuildTradePlan(g_PlanDirection,plan,reason))
-   {
-      SetPanelMessage("Preview blocked: " + reason,clrTomato);
-      return;
-   }
-
+   // Always draw BOTH buy and sell plan levels at the same time
    DeletePlanObjects();
-   DrawPlanLine(PLAN_PREFIX+"Entry",plan.entry,clrDodgerBlue,"ENTRY");
-   DrawPlanLine(PLAN_PREFIX+"SL",plan.sl,clrTomato,"SL");
-   DrawPlanLine(PLAN_PREFIX+"TP",plan.tp,clrLimeGreen,"FINAL TP");
 
-   for(int i=0; i<plan.partial_count; i++)
-      DrawPlanLine(PLAN_PREFIX+"P"+IntegerToString(i+1),plan.partial_prices[i],clrYellow,"TP"+IntegerToString(i+1));
+   string buy_reason = "";
+   string sell_reason = "";
+   TradePlan buy_plan, sell_plan;
+   bool buy_ok  = BuildTradePlan(ORDER_TYPE_BUY,buy_plan,buy_reason);
+   bool sell_ok = BuildTradePlan(ORDER_TYPE_SELL,sell_plan,sell_reason);
+
+   if(!buy_ok && !sell_ok)
+   {
+      SetPanelMessage("Preview blocked: " + buy_reason,clrTomato);
+      return;
+   }
+
+   if(buy_ok)
+      DrawPlanPreviewForSide(ORDER_TYPE_BUY,"BUY");
+
+   if(sell_ok)
+      DrawPlanPreviewForSide(ORDER_TYPE_SELL,"SELL");
 
    g_PreviewVisible = true;
-   SetPanelMessage("Preview visible",clrLimeGreen);
+
+   if(buy_ok && sell_ok)
+      SetPanelMessage("Preview: BUY + SELL levels",clrLimeGreen);
+   else if(buy_ok)
+      SetPanelMessage("Preview: BUY only (" + sell_reason + ")",clrGold);
+   else
+      SetPanelMessage("Preview: SELL only (" + buy_reason + ")",clrGold);
+
    ChartRedraw(0);
 }
 
