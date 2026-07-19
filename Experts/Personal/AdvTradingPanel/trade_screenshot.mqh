@@ -21,71 +21,27 @@ string GetTradeOpenScreenshotFileName(const ulong ticket)
 
 bool IsPanelObjectName(const string object_name)
 {
-   // Panel objects use PANEL_PREFIX (example: "ATP_UI_")
    return(StringFind(object_name,PANEL_PREFIX) == 0);
 }
 
-int HidePanelObjectsForScreenshot(long &saved_timeframes[])
+int MovePanelObjectsByX(const int delta_x)
 {
+   int moved = 0;
    int total = ObjectsTotal(0,0,-1);
-   ArrayResize(saved_timeframes,0);
 
-   int hidden_count = 0;
-
-   for(int i=total-1; i>=0; i--)
+   for(int i=0; i<total; i++)
    {
       string name = ObjectName(0,i,0,-1);
 
       if(!IsPanelObjectName(name))
          continue;
 
-      long current_tf = ObjectGetInteger(0,name,OBJPROP_TIMEFRAMES);
-
-      int n = ArraySize(saved_timeframes);
-      ArrayResize(saved_timeframes,n+1);
-      saved_timeframes[n] = current_tf;
-
-      // Hide on all periods
-      ObjectSetInteger(0,name,OBJPROP_TIMEFRAMES,OBJ_NO_PERIODS);
-      hidden_count++;
+      int x = (int)ObjectGetInteger(0,name,OBJPROP_XDISTANCE);
+      ObjectSetInteger(0,name,OBJPROP_XDISTANCE,x + delta_x);
+      moved++;
    }
 
-   return(hidden_count);
-}
-
-void RestorePanelObjectsAfterScreenshot(const long &saved_timeframes[])
-{
-   int total = ObjectsTotal(0,0,-1);
-   int restore_index = 0;
-
-   // Restore in the same reverse scan order used when hiding
-   for(int i=total-1; i>=0; i--)
-   {
-      string name = ObjectName(0,i,0,-1);
-
-      if(!IsPanelObjectName(name))
-         continue;
-
-      if(restore_index >= ArraySize(saved_timeframes))
-         break;
-
-      ObjectSetInteger(0,name,OBJPROP_TIMEFRAMES,saved_timeframes[restore_index]);
-      restore_index++;
-   }
-
-   // Fallback: if count mismatched, force all panel objects visible again
-   if(restore_index != ArraySize(saved_timeframes))
-   {
-      for(int j=ObjectsTotal(0,0,-1)-1; j>=0; j--)
-      {
-         string name = ObjectName(0,j,0,-1);
-
-         if(!IsPanelObjectName(name))
-            continue;
-
-         ObjectSetInteger(0,name,OBJPROP_TIMEFRAMES,OBJ_ALL_PERIODS);
-      }
-   }
+   return(moved);
 }
 
 string CaptureTradeOpenScreenshot(const ulong ticket)
@@ -93,50 +49,52 @@ string CaptureTradeOpenScreenshot(const ulong ticket)
    if(!InpCaptureScreenshotOnTradeOpen)
       return("");
 
+   if(g_PanelMovedForScreenshot)
+   {
+      MovePanelObjectsByX(-g_PanelScreenshotShiftX);
+      g_PanelScreenshotShiftX = 0;
+      g_PanelMovedForScreenshot = false;
+   }
+
    int width = MathMax(400,InpTradeOpenScreenshotWidth);
    int height = MathMax(300,InpTradeOpenScreenshotHeight);
    string file_name = GetTradeOpenScreenshotFileName(ticket);
 
-   long saved_timeframes[];
-   ArrayResize(saved_timeframes,0);
+   bool move_panel = !InpIncludePanelInTradeOpenScreenshot;
 
-   bool hide_panel = !InpIncludePanelInTradeOpenScreenshot;
-   int hidden_count = 0;
+   if(move_panel)
+   {
+      g_PanelScreenshotShiftX = -2000;
+      MovePanelObjectsByX(g_PanelScreenshotShiftX);
+      g_PanelMovedForScreenshot = true;
+      ChartRedraw(0);
+      Sleep(150);
+   }
+   else
+   {
+      ChartRedraw(0);
+      Sleep(80);
+   }
 
-   if(hide_panel)
-      hidden_count = HidePanelObjectsForScreenshot(saved_timeframes);
-
-   // Force chart redraw without panel before capture
-   ChartRedraw(0);
-   Sleep(120);
-
-   bool captured = ChartScreenShot(0,
-                                   file_name,
-                                   width,
-                                   height,
-                                   ALIGN_RIGHT);
-
+   ResetLastError();
+   bool captured = ChartScreenShot(0,file_name,width,height,ALIGN_RIGHT);
    int capture_error = GetLastError();
 
-   if(hide_panel)
+   if(g_PanelMovedForScreenshot)
    {
-      RestorePanelObjectsAfterScreenshot(saved_timeframes);
+      MovePanelObjectsByX(-g_PanelScreenshotShiftX);
+      g_PanelScreenshotShiftX = 0;
+      g_PanelMovedForScreenshot = false;
       ChartRedraw(0);
    }
 
    if(!captured)
    {
       LogError("SCREENSHOT",
-               "Failed to capture open screenshot for #" + (string)ticket +
-               ". Error=" + IntegerToString(capture_error));
+               "Failed open screenshot #" + (string)ticket +
+               " error=" + IntegerToString(capture_error));
       return("");
    }
-
-   LogInfo("SCREENSHOT",
-           "Open screenshot saved for #" + (string)ticket +
-           ": " + file_name +
-           (hide_panel ? (" [panel hidden objects=" + IntegerToString(hidden_count) + "]")
-                       : " [panel included]"));
 
    return(file_name);
 }

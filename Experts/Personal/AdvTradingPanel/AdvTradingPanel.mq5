@@ -60,6 +60,20 @@ int OnInit()
 
 void OnDeinit(const int reason)
 {
+   if(g_PanelMovedForScreenshot)
+   {
+      int total = ObjectsTotal(0,0,-1);
+      for(int i=0; i<total; i++)
+      {
+         string name = ObjectName(0,i,0,-1);
+         if(StringFind(name,PANEL_PREFIX) != 0)
+            continue;
+         int x = (int)ObjectGetInteger(0,name,OBJPROP_XDISTANCE);
+         ObjectSetInteger(0,name,OBJPROP_XDISTANCE,x - g_PanelScreenshotShiftX);
+      }
+      g_PanelScreenshotShiftX = 0;
+      g_PanelMovedForScreenshot = false;
+   }
    EventKillTimer();
    DeleteAllManagedPositionVisuals();
    DestroyPanelShell();

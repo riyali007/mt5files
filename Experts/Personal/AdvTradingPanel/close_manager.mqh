@@ -91,12 +91,23 @@ bool SendClosePositionRequest(const int index,const string source)
       return(false);
    }
    
-   // Journal immediately on accepted close request (pending full removal)
-   JournalManagedTradeEvent(index,
-                            "CLOSE_REQUEST",
-                            "Close request accepted source=" + source,
-                            source,
-                            volume);
+   MqlTick close_tick;
+   double close_price_now = state.entry_price;
+   if(SymbolInfoTick(state.symbol,close_tick))
+      close_price_now = (state.position_type == POSITION_TYPE_BUY ? close_tick.bid : close_tick.ask);
+   
+   WriteTradeJournalEvent("CLOSE_REQUEST",
+                          state.ticket,
+                          state.symbol,
+                          TradeJournalSideText(state.position_type),
+                          volume,
+                          close_price_now,
+                          0.0,
+                          0.0,
+                          0.0,
+                          "Close request accepted source=" + source,
+                          source,
+                          "");
    
    return(true);
 }

@@ -137,6 +137,8 @@ ulong g_SelectedTicket = 0;
 int g_SelectedTicketIndex = -1;
 double g_ManualPartialPercent = 0.0;
 bool g_DeveloperTestMode = false;
+int g_PanelScreenshotShiftX = 0;
+bool g_PanelMovedForScreenshot = false;
 
 ulong g_DetectedExternalTickets[];
 int g_SelectedExternalIndex = -1;

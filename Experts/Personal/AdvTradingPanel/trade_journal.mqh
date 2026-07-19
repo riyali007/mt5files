@@ -145,7 +145,25 @@ void JournalManagedTradeEvent(const int index,
    TradeState state = g_TradeStates[index];
 
    double volume = (volume_override >= 0.0 ? volume_override : state.current_volume);
-   double price = (price_override >= 0.0 ? price_override : state.entry_price);
+
+   MqlTick tick;
+   double price = state.entry_price;
+   if(price_override >= 0.0)
+      price = price_override;
+   else if(SymbolInfoTick(state.symbol,tick))
+      price = (state.position_type == POSITION_TYPE_BUY ? tick.bid : tick.ask);
+
+   double sl_out = 0.0;
+   double tp_out = 0.0;
+
+   // Only OPEN/ADOPT keep SL/TP. Lifecycle events send current price only.
+   if(event_name == "OPEN" || event_name == "ADOPT")
+   {
+      sl_out = state.stop_loss;
+      tp_out = state.take_profit;
+      if(price_override < 0.0)
+         price = state.entry_price;
+   }
 
    WriteTradeJournalEvent(event_name,
                           state.ticket,
@@ -153,11 +171,12 @@ void JournalManagedTradeEvent(const int index,
                           TradeJournalSideText(state.position_type),
                           volume,
                           price,
-                          state.stop_loss,
-                          state.take_profit,
+                          sl_out,
+                          tp_out,
                           profit_override,
                           note,
-                          source);
+                          source,
+                          "");
 }
 
 void JournalPositionOpenIfPossible(const ulong ticket,const string source)
@@ -192,15 +211,32 @@ void JournalPartialConfirmed(const int index,
    if(!InpTradeJournalLogPartials)
       return;
 
+   if(index < 0 || index >= ArraySize(g_TradeStates))
+      return;
+
+   TradeState state = g_TradeStates[index];
+
+   MqlTick tick;
+   double current_price = state.entry_price;
+   if(SymbolInfoTick(state.symbol,tick))
+      current_price = (state.position_type == POSITION_TYPE_BUY ? tick.bid : tick.ask);
+
    string note = "TP" + IntegerToString(partial_index + 1) +
                  " closed=" + DoubleToString(closed_volume,2) +
                  " remaining=" + DoubleToString(remaining_volume,2);
 
-   JournalManagedTradeEvent(index,
-                            "PARTIAL",
-                            note,
-                            "ENGINE",
-                            closed_volume);
+   WriteTradeJournalEvent("PARTIAL",
+                          state.ticket,
+                          state.symbol,
+                          TradeJournalSideText(state.position_type),
+                          closed_volume,
+                          current_price,
+                          0.0,
+                          0.0,
+                          0.0,
+                          note,
+                          "ENGINE",
+                          "");
 }
 
 void JournalBreakevenConfirmed(const int index,const double be_price)
@@ -208,12 +244,28 @@ void JournalBreakevenConfirmed(const int index,const double be_price)
    if(!InpTradeJournalLogBreakeven)
       return;
 
-   JournalManagedTradeEvent(index,
-                            "BREAKEVEN",
-                            "SL moved to " + DoubleToString(be_price,_Digits),
-                            "ENGINE",
-                            -1.0,
-                            be_price);
+   if(index < 0 || index >= ArraySize(g_TradeStates))
+      return;
+
+   TradeState state = g_TradeStates[index];
+
+   MqlTick tick;
+   double current_price = state.entry_price;
+   if(SymbolInfoTick(state.symbol,tick))
+      current_price = (state.position_type == POSITION_TYPE_BUY ? tick.bid : tick.ask);
+
+   WriteTradeJournalEvent("BREAKEVEN",
+                          state.ticket,
+                          state.symbol,
+                          TradeJournalSideText(state.position_type),
+                          state.current_volume,
+                          current_price,
+                          0.0,
+                          0.0,
+                          0.0,
+                          "BE SL=" + DoubleToString(be_price,_Digits),
+                          "ENGINE",
+                          "");
 }
 
 void JournalTrailingStopConfirmed(const int index,const double trail_price)
@@ -221,12 +273,28 @@ void JournalTrailingStopConfirmed(const int index,const double trail_price)
    if(!InpTradeJournalLogTrailingStop)
       return;
 
-   JournalManagedTradeEvent(index,
-                            "TRAIL_STOP",
-                            "SL trailed to " + DoubleToString(trail_price,_Digits),
-                            "ENGINE",
-                            -1.0,
-                            trail_price);
+   if(index < 0 || index >= ArraySize(g_TradeStates))
+      return;
+
+   TradeState state = g_TradeStates[index];
+
+   MqlTick tick;
+   double current_price = state.entry_price;
+   if(SymbolInfoTick(state.symbol,tick))
+      current_price = (state.position_type == POSITION_TYPE_BUY ? tick.bid : tick.ask);
+
+   WriteTradeJournalEvent("TRAIL_STOP",
+                          state.ticket,
+                          state.symbol,
+                          TradeJournalSideText(state.position_type),
+                          state.current_volume,
+                          current_price,
+                          0.0,
+                          0.0,
+                          0.0,
+                          "Trail SL=" + DoubleToString(trail_price,_Digits),
+                          "ENGINE",
+                          "");
 }
 
 void JournalAdoption(const int index,const string source)
@@ -252,17 +320,30 @@ void JournalCloseEvent(const ulong ticket,
    if(!InpTradeJournalLogClose)
       return;
 
+   MqlTick tick;
+   double current_price = price;
+   if(SymbolInfoTick(symbol,tick))
+   {
+      if(side == "BUY")
+         current_price = tick.bid;
+      else if(side == "SELL")
+         current_price = tick.ask;
+      else
+         current_price = tick.bid;
+   }
+
    WriteTradeJournalEvent("CLOSE",
                           ticket,
                           symbol,
                           side,
                           volume,
-                          price,
+                          current_price,
                           0.0,
                           0.0,
                           profit,
                           note,
-                          source);
+                          source,
+                          "");
 }
 
 bool InitializeTradeJournal()

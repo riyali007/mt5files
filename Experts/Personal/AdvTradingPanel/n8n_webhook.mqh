@@ -1,4 +1,4 @@
-#ifndef ADVTP_N8N_WEBHOOK_MQH
+﻿#ifndef ADVTP_N8N_WEBHOOK_MQH
 #define ADVTP_N8N_WEBHOOK_MQH
 
 string EscapeJsonString(const string value)
@@ -103,6 +103,176 @@ string BuildN8nJournalPayload(const string event_name,
    return(json);
 }
 
+string BuildN8nMultipartBoundary()
+{
+   return("----ATPBoundary" + IntegerToString((int)TimeLocal()) + IntegerToString(GetTickCount()));
+}
+
+bool ReadScreenshotFileToArray(const string file_name,uchar &data[])
+{
+   ArrayResize(data,0);
+
+   if(StringLen(file_name) <= 0)
+      return(false);
+
+   // ChartScreenShot saves into terminal MQL5\Files (not FILE_COMMON)
+   int handle = FileOpen(file_name,FILE_READ|FILE_BIN|FILE_SHARE_READ);
+   if(handle == INVALID_HANDLE)
+   {
+      LogError("N8N","Cannot open screenshot '" + file_name + "' err=" + IntegerToString(GetLastError()));
+      return(false);
+   }
+
+   ulong size = FileSize(handle);
+   if(size == 0 || size > 15000000)
+   {
+      FileClose(handle);
+      LogError("N8N","Screenshot size invalid: " + (string)size);
+      return(false);
+   }
+
+   ArrayResize(data,(int)size);
+   uint read = FileReadArray(handle,data,0,(int)size);
+   FileClose(handle);
+
+   if(read != size)
+   {
+      ArrayResize(data,0);
+      LogError("N8N","Screenshot read incomplete");
+      return(false);
+   }
+
+   return(true);
+}
+
+void CharArrayAppendString(char &body[],const string text)
+{
+   uchar tmp[];
+   StringToCharArray(text,tmp,0,WHOLE_ARRAY,CP_UTF8);
+
+   int add = ArraySize(tmp);
+   if(add <= 0)
+      return;
+
+   // StringToCharArray includes trailing '\0' — drop it
+   add--;
+   if(add <= 0)
+      return;
+
+   int old = ArraySize(body);
+   ArrayResize(body,old + add);
+   for(int i=0; i<add; i++)
+      body[old + i] = (char)tmp[i];
+}
+
+void CharArrayAppendBytes(char &body[],const uchar &data[])
+{
+   int add = ArraySize(data);
+   if(add <= 0)
+      return;
+
+   int old = ArraySize(body);
+   ArrayResize(body,old + add);
+   for(int i=0; i<add; i++)
+      body[old + i] = (char)data[i];
+}
+
+bool SendN8nOpenEventWithScreenshot(const ulong ticket,
+                                     const string symbol,
+                                     const string side,
+                                     const double volume,
+                                     const double price,
+                                     const double sl,
+                                     const double tp,
+                                     const double profit,
+                                     const string note,
+                                     const string source,
+                                     const string screenshot_file)
+{
+   if(!IsN8nWebhookAvailable())
+      return(false);
+
+   if(!IsN8nEventEnabled("OPEN"))
+      return(false);
+
+   uchar file_data[];
+   bool has_file = ReadScreenshotFileToArray(screenshot_file,file_data);
+
+   // Fallback: no file -> normal JSON open event
+   if(!has_file)
+   {
+      return(SendN8nJournalEvent("OPEN",ticket,symbol,side,volume,price,sl,tp,profit,note,source,screenshot_file));
+   }
+
+   string boundary = BuildN8nMultipartBoundary();
+   char body[];
+   ArrayResize(body,0);
+
+   // text fields
+   string fields[16][2];
+   fields[0][0] = "timestamp"; fields[0][1] = TimeToString(TimeCurrent(),TIME_DATE|TIME_SECONDS);
+   fields[1][0] = "event"; fields[1][1] = "OPEN";
+   fields[2][0] = "ticket"; fields[2][1] = (string)ticket;
+   fields[3][0] = "symbol"; fields[3][1] = symbol;
+   fields[4][0] = "side"; fields[4][1] = side;
+   fields[5][0] = "volume"; fields[5][1] = DoubleToString(volume,2);
+   fields[6][0] = "price"; fields[6][1] = DoubleToString(price,_Digits);
+   fields[7][0] = "sl"; fields[7][1] = DoubleToString(sl,_Digits);
+   fields[8][0] = "tp"; fields[8][1] = DoubleToString(tp,_Digits);
+   fields[9][0] = "profit"; fields[9][1] = DoubleToString(profit,2);
+   fields[10][0] = "note"; fields[10][1] = note;
+   fields[11][0] = "magic"; fields[11][1] = (string)InpMagicNumber;
+   fields[12][0] = "source"; fields[12][1] = source;
+   fields[13][0] = "ea_name"; fields[13][1] = APP_SHORT_NAME;
+   fields[14][0] = "account_login"; fields[14][1] = (string)AccountInfoInteger(ACCOUNT_LOGIN);
+   fields[15][0] = "screenshot_file"; fields[15][1] = screenshot_file;
+
+   for(int i=0; i<16; i++)
+   {
+      CharArrayAppendString(body,"--" + boundary + "\r\n");
+      CharArrayAppendString(body,"Content-Disposition: form-data; name=\"" + fields[i][0] + "\"\r\n\r\n");
+      CharArrayAppendString(body,fields[i][1] + "\r\n");
+   }
+
+   // file field (name must match n8n binary property expectation)
+   CharArrayAppendString(body,"--" + boundary + "\r\n");
+   CharArrayAppendString(body,"Content-Disposition: form-data; name=\"screenshot\"; filename=\"" + screenshot_file + "\"\r\n");
+   CharArrayAppendString(body,"Content-Type: image/png\r\n\r\n");
+   CharArrayAppendBytes(body,file_data);
+   CharArrayAppendString(body,"\r\n");
+   CharArrayAppendString(body,"--" + boundary + "--\r\n");
+
+   char response_body[];
+   string response_headers;
+   string headers = "Content-Type: multipart/form-data; boundary=" + boundary + "\r\n";
+
+   ResetLastError();
+   int http_code = WebRequest("POST",
+                              InpN8nWebhookUrl,
+                              headers,
+                              InpN8nWebhookTimeoutMs,
+                              body,
+                              response_body,
+                              response_headers);
+
+   int terminal_error = GetLastError();
+
+   if(http_code < 200 || http_code >= 300)
+   {
+      LogN8nFailureThrottled(
+         "Multipart OPEN failed HTTP=" + IntegerToString(http_code) +
+         " err=" + IntegerToString(terminal_error) +
+         " ticket=#" + (string)ticket
+      );
+      return(false);
+   }
+
+   if(InpShowDeveloperControls)
+      LogInfo("N8N","OPEN+screenshot sent HTTP=" + IntegerToString(http_code) + " ticket=#" + (string)ticket);
+
+   return(true);
+}
+
 bool SendN8nJournalEvent(const string event_name,
                           const ulong ticket,
                           const string symbol,
@@ -121,6 +291,11 @@ bool SendN8nJournalEvent(const string event_name,
 
    if(!IsN8nEventEnabled(event_name))
       return(false);
+  // Only OPEN uploads the image file
+   if(event_name == "OPEN" && StringLen(screenshot_file) > 0)
+   {
+      return(SendN8nOpenEventWithScreenshot(ticket,symbol,side,volume,price,sl,tp,profit,note,source,screenshot_file));
+   }
 
    string payload = BuildN8nJournalPayload(event_name,
                                         ticket,
