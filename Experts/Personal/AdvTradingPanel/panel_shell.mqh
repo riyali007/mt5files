@@ -378,7 +378,8 @@ void ReadPlanInputs()
    if(g_OrderMode == ATP_ORDER_LIMIT)
       g_PlanPrice = StringToDouble(ObjectGetString(0,OBJ_PRICE,OBJPROP_TEXT));
 
-   g_PlanPartialCount = MathMax(1,MathMin(5,g_PlanPartialCount));
+   int max_parts = MathMax(1, InpMaxPartialCount);
+   g_PlanPartialCount = MathMax(1, MathMin(max_parts, g_PlanPartialCount));
    g_IsEditingPrice = false;
    g_PanelDirty = true;
 }

@@ -16,7 +16,8 @@ input group "Order Defaults"
 input double InpDefaultLot = 0.30;
 input int InpDefaultSLPoints = 700;
 input int InpDefaultTPPoints = 1500;
-input int InpDefaultPartialCount = 4;
+input int InpDefaultPartialCount = 5;
+input int InpMaxPartialCount = 20;   // UI + engine max partial levels (was hard-coded 5)
 input int InpDeviationPoints = 20;
 
 input group "Partial Defaults"
