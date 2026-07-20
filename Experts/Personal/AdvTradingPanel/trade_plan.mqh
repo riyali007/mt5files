@@ -8,7 +8,8 @@ void InitializeTradePlan()
    g_PlanLot = InpDefaultLot;
    g_PlanSLPoints = InpDefaultSLPoints;
    g_PlanTPPoints = InpDefaultTPPoints;
-   g_PlanPartialCount = MathMax(1,MathMin(5,InpDefaultPartialCount));
+   int max_parts = MathMax(1, InpMaxPartialCount);
+   g_PlanPartialCount = MathMax(1, MathMin(max_parts, InpDefaultPartialCount));
    g_PlanPrice = 0.0;
    g_PreviewVisible = false;
    g_IsEditingPrice = false;
@@ -106,9 +107,11 @@ bool BuildTradePlan(const ENUM_ORDER_TYPE direction,TradePlan &plan,string &reas
       return(false);
    }
 
-   if(g_PlanPartialCount < 1 || g_PlanPartialCount > 5)
+   int max_parts = MathMax(1, InpMaxPartialCount);
+
+   if(g_PlanPartialCount < 1 || g_PlanPartialCount > max_parts)
    {
-      reason = "Partial count must be 1 to 5";
+      reason = "Partial count must be 1 to " + IntegerToString(max_parts);
       return(false);
    }
 

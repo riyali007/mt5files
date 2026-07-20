@@ -57,8 +57,11 @@ bool LoadPersistedTradeState(const ulong ticket,TradeState &state)
    if(state.partial_count < 0)
       state.partial_count = 0;
 
-   if(state.partial_count > 5)
-      state.partial_count = 5;
+   int max_parts = MathMax(1, InpMaxPartialCount);
+   if(state.partial_count > max_parts)
+      state.partial_count = max_parts;
+   if(state.partial_count < 0)
+      state.partial_count = 0;
 
    ArrayResize(state.partial_done,state.partial_count);
    ArrayResize(state.partial_prices,state.partial_count);

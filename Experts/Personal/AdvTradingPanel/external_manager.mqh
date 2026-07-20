@@ -269,7 +269,8 @@ bool AdoptExternalTicket(const ulong ticket,const string source)
    }
    else
    {
-      state.partial_count = MathMax(1,MathMin(5,g_PlanPartialCount));
+      int max_parts = MathMax(1, InpMaxPartialCount);
+      state.partial_count = MathMax(1, MathMin(max_parts, g_PlanPartialCount));
 
       // Option A: if no TP yet, still keep count; rebuild after default SL/TP apply
       if(state.take_profit <= 0.0)

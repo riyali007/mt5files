@@ -113,7 +113,8 @@ bool RegisterManagedPosition(const ulong ticket)
    else
    {
       state.original_volume = state.current_volume;
-      state.partial_count = MathMax(1,MathMin(5,g_PlanPartialCount));
+      int max_parts = MathMax(1, InpMaxPartialCount);
+      state.partial_count = MathMax(1, MathMin(max_parts, g_PlanPartialCount));
 
       if(state.take_profit <= 0.0)
          state.partial_count = 0;

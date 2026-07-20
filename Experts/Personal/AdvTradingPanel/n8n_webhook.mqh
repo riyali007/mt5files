@@ -212,7 +212,7 @@ bool SendN8nOpenEventWithScreenshot(const ulong ticket,
    ArrayResize(body,0);
 
    // text fields
-   string fields[16][2];
+   string fields[17][2];
    fields[0][0] = "timestamp"; fields[0][1] = TimeToString(TimeCurrent(),TIME_DATE|TIME_SECONDS);
    fields[1][0] = "event"; fields[1][1] = "OPEN";
    fields[2][0] = "ticket"; fields[2][1] = (string)ticket;
@@ -228,9 +228,10 @@ bool SendN8nOpenEventWithScreenshot(const ulong ticket,
    fields[12][0] = "source"; fields[12][1] = source;
    fields[13][0] = "ea_name"; fields[13][1] = APP_SHORT_NAME;
    fields[14][0] = "account_login"; fields[14][1] = (string)AccountInfoInteger(ACCOUNT_LOGIN);
-   fields[15][0] = "screenshot_file"; fields[15][1] = screenshot_file;
+   fields[15][0] = "account_server"; fields[15][1] = EscapeJsonString(AccountInfoString(ACCOUNT_SERVER));
+   fields[16][0] = "screenshot_file"; fields[16][1] = screenshot_file;
 
-   for(int i=0; i<16; i++)
+   for(int i=0; i<17; i++)
    {
       CharArrayAppendString(body,"--" + boundary + "\r\n");
       CharArrayAppendString(body,"Content-Disposition: form-data; name=\"" + fields[i][0] + "\"\r\n\r\n");
