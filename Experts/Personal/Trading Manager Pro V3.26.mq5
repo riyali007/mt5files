@@ -42,8 +42,8 @@ input int    InpBE_Offset  = 20;
 
 input group "Trailing Stop Settings"
 input bool   InpUseTrailingStop = true;
-input int    InpTrailingStart   = 800;
-input int    InpTrailingStep    = 500;
+input int    InpTrailingStart   = 1000;
+input int    InpTrailingStep    = 600;
 
 input group "Sound Settings"
 input bool   InpEnableSounds = true;
@@ -1498,7 +1498,7 @@ int PanelHeight()
    // Increased base height (was 430) to give the Trade Selector row and
    // Partial/BE/Close-Selected buttons more breathing room, and added a
    // fixed bottom margin so the panel doesn't feel cramped against its own edge.
-   return 480 + PositionListHeight() + 20;
+   return 550 + PositionListHeight() + 20;
 }
 
 int PositionListHeight()
@@ -1661,7 +1661,7 @@ void UpdatePartialLine(int x, int y)
    for(int i = 1; i <= ui.partialsCount; i++)
    {
       int pts = (int)MathRound(step * i);
-      txt += "TP" + IntegerToString(i) + ":" + IntegerToString(pts);
+      txt += "TP" + IntegerToString(i) + ":" + IntegerToString(pts/10);
       if(i < ui.partialsCount) txt += " | ";
    }
 
