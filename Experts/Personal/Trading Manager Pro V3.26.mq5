@@ -11,6 +11,32 @@
 #include <Trade\PositionInfo.mqh>
 
 //+------------------------------------------------------------------+
+//| Windows GDI+ and Kernel32 API Imports (For JPEG Compression)     |
+//+------------------------------------------------------------------+
+#import "gdiplus.dll"
+int GdiplusStartup(ulong &token, uchar &gdiInput[], ulong gdiOutput);
+void GdiplusShutdown(ulong token);
+int GdipLoadImageFromFile(string filename, ulong &image);
+int GdipDisposeImage(ulong image);
+int GdipSaveImageToFile(ulong image, string filename, uchar &clsid[], uchar &encoderParams[]);
+#import
+
+#import "ole32.dll"
+int CLSIDFromString(string lpsz, uchar &pclsid[]);
+#import
+
+#import "kernel32.dll"
+ulong GlobalAlloc(uint uFlags, ulong dwBytes);
+ulong GlobalFree(ulong hMem);
+void RtlMoveMemory(ulong dest, uint &src[], ulong length);
+#import
+
+// Helper to cast pointers in 64-bit memory
+union ULongToBytes {
+   ulong value;
+   uchar bytes[8];
+};
+//+------------------------------------------------------------------+
 //| INPUTS                                                            |
 //+------------------------------------------------------------------+
 input group "Panel Settings"
@@ -75,6 +101,7 @@ input bool   InpEnableJournaling = true;
 input string InpWebhookURL       = "https://your-webhook-url.com/endpoint";
 input string APP_SHORT_NAME      = "TM3_Pro";
 input int    InpMagicNumber      = 234567; // Replaces the #define MAGIC
+input int    InpImageQuality     = 50; // Replaces the #define MAGIC
 
 //--- Add to Globals ---
 double g_cached_sl[];
@@ -2016,11 +2043,11 @@ string BuildJSON(string event_name, ulong ticket, string symbol, string side,
 }
 
 //+------------------------------------------------------------------+
-//| Take Clean Screenshot (Size & Resolution Optimized)              |
+//| Take Clean Screenshot (100% Resolution, 30% File Size)           |
 //+------------------------------------------------------------------+
 string TakeCleanScreenshot(ulong ticket, string event_name)
 {
-   // 1. Move UI out of bounds to hide the panel
+   // 1. Move UI out of bounds
    int total = ObjectsTotal(0, -1, -1);
    for(int i = 0; i < total; i++)
    {
@@ -2035,26 +2062,21 @@ string TakeCleanScreenshot(ulong ticket, string event_name)
    ChartRedraw(0);
    Sleep(50); 
    
-   // 2. Generate Filename (.jpg)
-   string filename = "Journal\\" + (string)ticket + "_" + event_name + "_" + TimeToString(TimeCurrent(), TIME_DATE|TIME_MINUTES) + ".jpg";
-   StringReplace(filename, ":", "");
-   StringReplace(filename, ".", "");
-   StringReplace(filename, " ", "_");
+   // 2. Generate Filenames
+   string baseFilename = "Journal\\" + (string)ticket + "_" + event_name + "_" + TimeToString(TimeCurrent(), TIME_DATE|TIME_MINUTES);
+   StringReplace(baseFilename, ":", "");
+   StringReplace(baseFilename, ".", "");
+   StringReplace(baseFilename, " ", "_");
    
-   // 3. Optimize Size: Capture at 30% of the actual screen resolution
+   string bmpFile = baseFilename + "_raw.bmp";
+   string jpgFile = baseFilename + ".jpg";
+   
+   // 3. Capture at 100% full chart resolution as raw BMP
    int chart_w = (int)ChartGetInteger(0, CHART_WIDTH_IN_PIXELS);
    int chart_h = (int)ChartGetInteger(0, CHART_HEIGHT_IN_PIXELS);
+   ChartScreenShot(0, bmpFile, chart_w, chart_h, ALIGN_RIGHT);
    
-   int capture_w = (int)(chart_w * 0.30); // 30% of original width
-   int capture_h = (int)(chart_h * 0.30); // 30% of original height
-   
-   // Fallback minimums (prevents the image from being too tiny to read)
-   if(capture_w < 480) capture_w = 480;
-   if(capture_h < 320) capture_h = 320;
-   
-   ChartScreenShot(0, filename, capture_w, capture_h, ALIGN_RIGHT);
-   
-   // 4. Restore UI panel to original position
+   // 4. Restore UI
    for(int i = 0; i < total; i++)
    {
       string name = ObjectName(0, i);
@@ -2066,7 +2088,15 @@ string TakeCleanScreenshot(ulong ticket, string event_name)
    }
    ChartRedraw(0);
    
-   return filename;
+   // 5. Compress to 30% Quality JPEG
+   if(CompressJPEG(bmpFile, jpgFile, InpImageQuality)) // The '30' here is your quality target
+   {
+      FileDelete(bmpFile); // Remove the heavy raw file
+      return jpgFile;
+   }
+   
+   // Fallback in case of Windows API failure
+   return bmpFile;
 }
 //+------------------------------------------------------------------+
 //| Add Event to Delay Queue (Non-Blocking)                          |
@@ -2131,7 +2161,7 @@ void ProcessJournalEvent(string event_name, ulong ticket, string symbol, string 
    SendJournalWebhook(event_name, ticket, symbol, side, volume, price, sl, tp, profit, note, source, screenshot_file);
 }
 //+------------------------------------------------------------------+
-//| Execute Journal Event via Webhook                                |
+//| Execute Journal Event via Webhook (Multipart & JSON Hybrid)      |
 //+------------------------------------------------------------------+
 bool SendJournalWebhook(const string event_name, const ulong ticket, const string symbol, 
                         const string side, const double volume, const double price, 
@@ -2141,9 +2171,15 @@ bool SendJournalWebhook(const string event_name, const ulong ticket, const strin
    if(InpWebhookURL == "") return false;
 
    uchar file_data[];
-   bool has_file = ReadScreenshotFileToArray(screenshot_file, file_data);
+   bool has_file = false;
+   
+   // Only attempt to read the file if a filename was provided
+   if(StringLen(screenshot_file) > 0)
+   {
+      has_file = ReadScreenshotFileToArray(screenshot_file, file_data);
+   }
 
-   // --- MULTIPART/FORM-DATA (For events with screenshots) ---
+   // --- MULTIPART/FORM-DATA (For events with screenshots, e.g., OPEN) ---
    if(has_file)
    {
       string boundary = BuildMultipartBoundary();
@@ -2169,6 +2205,7 @@ bool SendJournalWebhook(const string event_name, const ulong ticket, const strin
       fields[15][0] = "account_server";fields[15][1] = AccountInfoString(ACCOUNT_SERVER);
       fields[16][0] = "chart_symbol";  fields[16][1] = _Symbol;
 
+      // Append Text Fields
       for(int i = 0; i < 17; i++)
       {
          CharArrayAppendString(body, "--" + boundary + "\r\n");
@@ -2176,10 +2213,10 @@ bool SendJournalWebhook(const string event_name, const ulong ticket, const strin
          CharArrayAppendString(body, fields[i][1] + "\r\n");
       }
 
-      // File Field
+      // Append File Field (Set to image/jpeg for the GDI+ compressed image)
       CharArrayAppendString(body, "--" + boundary + "\r\n");
       CharArrayAppendString(body, "Content-Disposition: form-data; name=\"screenshot\"; filename=\"" + screenshot_file + "\"\r\n");
-      CharArrayAppendString(body, "Content-Type: image/png\r\n\r\n");
+      CharArrayAppendString(body, "Content-Type: image/jpeg\r\n\r\n");
       CharArrayAppendBytes(body, file_data);
       CharArrayAppendString(body, "\r\n");
       CharArrayAppendString(body, "--" + boundary + "--\r\n");
@@ -2189,7 +2226,8 @@ bool SendJournalWebhook(const string event_name, const ulong ticket, const strin
       string headers = "Content-Type: multipart/form-data; boundary=" + boundary + "\r\n";
 
       ResetLastError();
-      int http_code = WebRequest("POST", InpWebhookURL, headers, 5000, body, response_body, response_headers);
+      // 10000ms timeout to ensure large files have time to upload
+      int http_code = WebRequest("POST", InpWebhookURL, headers, 10000, body, response_body, response_headers);
       
       if(http_code < 200 || http_code >= 300)
          Print("[TM3] Multipart Webhook failed. HTTP=", http_code, " Err=", GetLastError());
@@ -2197,7 +2235,7 @@ bool SendJournalWebhook(const string event_name, const ulong ticket, const strin
       return (http_code >= 200 && http_code < 300);
    }
    
-   // --- APPLICATION/JSON (For events without screenshots) ---
+   // --- APPLICATION/JSON (For events without screenshots, e.g., SL/TP Hits) ---
    else 
    {
       string payload = BuildJSON(event_name, ticket, symbol, side, volume, price, sl, tp, profit, note, source, "");
@@ -2207,7 +2245,9 @@ bool SendJournalWebhook(const string event_name, const ulong ticket, const strin
       string response_headers;
 
       StringToCharArray(payload, request_body, 0, WHOLE_ARRAY, CP_UTF8);
-      if(ArraySize(request_body) > 0) ArrayResize(request_body, ArraySize(request_body)-1); // Remove null terminator
+      // Strip the trailing null character added by StringToCharArray to prevent JSON parsing errors
+      if(ArraySize(request_body) > 0) 
+         ArrayResize(request_body, ArraySize(request_body) - 1); 
 
       string headers = "Content-Type: application/json\r\n";
 
@@ -2220,7 +2260,6 @@ bool SendJournalWebhook(const string event_name, const ulong ticket, const strin
       return (http_code >= 200 && http_code < 300);
    }
 }
-
 //+------------------------------------------------------------------+
 //| Webhook Helpers                                                  |
 //+------------------------------------------------------------------+
@@ -2287,4 +2326,64 @@ void CharArrayAppendBytes(char &body[], const uchar &data[])
    int old = ArraySize(body);
    ArrayResize(body, old + add);
    for(int i = 0; i < add; i++) body[old + i] = (char)data[i];
+}
+
+//+------------------------------------------------------------------+
+//| Native GDI+ Image Compressor (100% Res, 30% Quality)             |
+//+------------------------------------------------------------------+
+bool CompressJPEG(string inputFile, string outputFile, uint qualityLevel)
+{
+   // 1. Resolve absolute paths (GDI+ requires full Windows paths, not MT5 relative paths)
+   string dataPath = TerminalInfoString(TERMINAL_DATA_PATH) + "\\MQL5\\Files\\";
+   string absInput = dataPath + inputFile;
+   string absOutput = dataPath + outputFile;
+
+   // 2. Initialize GDI+
+   uchar startupInput[24] = {1,0,0,0, 0,0,0,0, 0,0,0,0,0,0,0,0, 0,0,0,0, 0,0,0,0};
+   ulong gdiToken = 0;
+   if(GdiplusStartup(gdiToken, startupInput, 0) != 0) return false;
+
+   // 3. Get Windows CLSID for JPEG Encoder
+   uchar jpegClsid[16];
+   CLSIDFromString("{557CF401-1A04-11D3-9A73-0000F81EF32E}", jpegClsid);
+
+   // 4. Load the raw uncompressed image
+   ulong imagePtr = 0;
+   if(GdipLoadImageFromFile(absInput, imagePtr) != 0)
+   {
+      GdiplusShutdown(gdiToken);
+      return false;
+   }
+
+   // 5. Build C++ EncoderParameters memory struct for Image Quality
+   ulong valPtr = GlobalAlloc(0x0040, 4); // Allocate memory for the integer
+   uint qualArr[1];
+   qualArr[0] = qualityLevel;
+   RtlMoveMemory(valPtr, qualArr, 4);     // Move our quality level into memory
+
+   uchar encParams[40];
+   ArrayInitialize(encParams, 0);
+   encParams[0] = 1; // Count = 1
+   
+   // GUID for Quality Parameter: {1D5BE4B5-FA4A-452D-9CDD-5DB35105E7EB}
+   uchar guid[16] = {0xB5,0xE4,0x5B,0x1D, 0x4A,0xFA, 0x2D,0x45, 0x9C,0xDD, 0x5D,0xB3,0x51,0x05,0xE7,0xEB};
+   ArrayCopy(encParams, guid, 8, 0, 16);
+   
+   encParams[24] = 1; // NumberOfValues = 1
+   encParams[28] = 4; // Type = 4 (EncoderParameterValueTypeLong)
+   
+   // Insert our memory pointer into the struct
+   ULongToBytes ptrConv;
+   ptrConv.value = valPtr;
+   ArrayCopy(encParams, ptrConv.bytes, 32, 0, 8);
+
+   // 6. Save the compressed JPEG
+   int res = GdipSaveImageToFile(imagePtr, absOutput, jpegClsid, encParams);
+
+   // 7. Clean up memory to prevent leaks
+   GlobalFree(valPtr);
+   GdipDisposeImage(imagePtr);
+   GdiplusShutdown(gdiToken);
+
+   return (res == 0);
 }
