@@ -69,6 +69,17 @@ input group "Auto Trade Handler"
 input bool   InpBasketEnabled     = true;
 input int    InpBasketGreenPoints = 0;
 
+//--- Add under existing input groups ---
+input group "Journaling Settings"
+input bool   InpEnableJournaling = true;
+input string InpWebhookURL       = "https://your-webhook-url.com/endpoint";
+input string APP_SHORT_NAME      = "TM3_Pro";
+input int    InpMagicNumber      = 234567; // Replaces the #define MAGIC
+
+//--- Add to Globals ---
+double g_cached_sl[];
+double g_cached_tp[];
+
 //+------------------------------------------------------------------+
 //| CONSTANTS                                                         |
 //+------------------------------------------------------------------+
@@ -117,8 +128,28 @@ struct PosState
    int    partialsTaken;
    int    slPartialsTaken;
    bool   beSet;
+   double lastSL;  // Add this
+   double lastTP;  // Add this
 };
 
+//--- Journaling Queue System ---
+struct JournalTask
+{
+   datetime trigger_time; // When to execute this event
+   string   event_name;
+   ulong    ticket;
+   string   symbol;
+   string   side;
+   double   volume;
+   double   price;
+   double   sl;
+   double   tp;
+   double   profit;
+   string   note;
+   string   source;
+};
+
+JournalTask g_JournalQueue[];
 //+------------------------------------------------------------------+
 //| GLOBALS                                                            |
 //+------------------------------------------------------------------+
@@ -220,6 +251,7 @@ int OnInit()
 
    PrintFormat("[TM3 v3.26] Ready | BE after Partial#%d (+%dpts) | Trailing=%s | AutoAdoptExternal=%s",
                InpBE_Trigger, InpBE_Offset, InpUseTrailingStop ? "ON" : "OFF", InpAutoAdoptExternal ? "ON" : "OFF");
+   EventSetTimer(1);// Starts a 1-second background timer for the queue
    return INIT_SUCCEEDED;
 }
 
@@ -233,6 +265,7 @@ void OnDeinit(const int reason)
    ObjectsDeleteAll(0, g_prefix);
    ArrayFree(g_ExtTrades);
    ArrayFree(g_PosStates);
+   EventKillTimer(); // Clean up the timer when the EA is removed
 }
 
 //+------------------------------------------------------------------+
@@ -246,8 +279,71 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
                          const MqlTradeRequest &request,
                          const MqlTradeResult &result)
 {
-   if(trans.type == TRADE_TRANSACTION_DEAL_ADD || trans.type == TRADE_TRANSACTION_POSITION)
+   if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
+   {
       RecomputeHasOpenTrades();
+      
+      ulong ticket = trans.position;
+      if(HistoryDealSelect(trans.deal))
+      {
+         long entry = HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+         string symbol = HistoryDealGetString(trans.deal, DEAL_SYMBOL);
+         long type = HistoryDealGetInteger(trans.deal, DEAL_TYPE);
+         double vol = HistoryDealGetDouble(trans.deal, DEAL_VOLUME);
+         double price = HistoryDealGetDouble(trans.deal, DEAL_PRICE);
+         
+         // Event 1: OPEN (Screenshot Taken)
+         if(entry == DEAL_ENTRY_IN)
+         {
+            // For entry deals, the deal type is the actual position type.
+            string side = (type == DEAL_TYPE_BUY) ? "BUY" : "SELL";
+            JournalEvent("OPEN", ticket, symbol, side, vol, price, 0, 0, 0, "Trade Opened", "System");
+         }
+         // Events 2, 3, 4, etc: OUT Deals (No Screenshot)
+         else if(entry == DEAL_ENTRY_OUT)
+         {
+            // CRITICAL FIX: An OUT deal of type SELL means the original position was a BUY. 
+            // We invert it here so the journal records the ACTUAL side of the original trade.
+            string actual_side = (type == DEAL_TYPE_SELL) ? "BUY" : "SELL";
+            
+            double profit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT) + HistoryDealGetDouble(trans.deal, DEAL_COMMISSION) + HistoryDealGetDouble(trans.deal, DEAL_SWAP);
+            long reason = HistoryDealGetInteger(trans.deal, DEAL_REASON);
+            
+            string event_type = "";
+            
+            // Check if position still exists (meaning only a part of the volume was closed)
+            if(PositionSelectByTicket(ticket)) 
+            {
+               event_type = "PARTIAL";
+            }
+            else
+            {
+               // If the broker closed it because the physical Stop Loss was hit
+               if(reason == DEAL_REASON_SL)
+               {
+                  if(profit < 0) event_type = "SL_Hit";
+                  else event_type = "BE_Hit"; // Positive or 0 profit SL is a Breakeven/Trailing Stop
+               }
+               // If the broker closed it because the Take Profit was hit
+               else if(reason == DEAL_REASON_TP)
+               {
+                  event_type = "TP_Hit";
+               }
+               // If closed manually by the user OR automatically by the EA (like the Basket logic)
+               else 
+               {
+                  event_type = "CLOSE";
+               }
+            }
+            
+            JournalEvent(event_type, ticket, symbol, actual_side, vol, price, 0, 0, profit, "Position Exit", "System");
+         }
+      }
+   }
+   else if(trans.type == TRADE_TRANSACTION_POSITION)
+   {
+      RecomputeHasOpenTrades();
+   }
 }
 
 void RecomputeHasOpenTrades()
@@ -358,14 +454,43 @@ void OnTick()
       }
    }
 
+   // Run cleanup unconditionally every 3 seconds to catch the final closing trade
    static datetime lastCleanup = 0;
-   if(g_HasOpenTrades && TimeCurrent() - lastCleanup >= 3)
+   if(TimeCurrent() - lastCleanup >= 3)
    {
       CleanupOrphanedLines();
       lastCleanup = TimeCurrent();
    }
 }
-
+//+------------------------------------------------------------------+
+//| Background Timer for Asynchronous Queue                          |
+//+------------------------------------------------------------------+
+void OnTimer()
+{
+   int n = ArraySize(g_JournalQueue);
+   if(n == 0) return;
+   
+   datetime now = TimeCurrent();
+   
+   // Check if the oldest task in the queue is ready to trigger
+   if(now >= g_JournalQueue[0].trigger_time)
+   {
+      // Execute the heavy processing (Screenshot, CSV, Webhook)
+      ProcessJournalEvent(
+         g_JournalQueue[0].event_name, g_JournalQueue[0].ticket, g_JournalQueue[0].symbol, 
+         g_JournalQueue[0].side, g_JournalQueue[0].volume, g_JournalQueue[0].price, 
+         g_JournalQueue[0].sl, g_JournalQueue[0].tp, g_JournalQueue[0].profit, 
+         g_JournalQueue[0].note, g_JournalQueue[0].source
+      );
+                   
+      // Remove the executed event from the queue and shift the rest up
+      for(int i = 0; i < n - 1; i++)
+      {
+         g_JournalQueue[i] = g_JournalQueue[i + 1];
+      }
+      ArrayResize(g_JournalQueue, n - 1);
+   }
+}
 //+------------------------------------------------------------------+
 //| CHART EVENTS                                                       |
 //+------------------------------------------------------------------+
@@ -475,8 +600,9 @@ void EnsurePosState(long posID, ulong ticket)
    g_PosStates[n].partialsTaken = 0;
    g_PosStates[n].slPartialsTaken = 0;
    g_PosStates[n].beSet = false;
+   g_PosStates[n].lastSL = 0.0; // Initialize
+   g_PosStates[n].lastTP = 0.0; // Initialize
 }
-
 void RemovePosState(long posID)
 {
    int idx = FindPosStateIdx(posID);
@@ -571,6 +697,27 @@ void ManagePositions()
       EnsurePosState(pid, ticket);
       int stIdx = FindPosStateIdx(pid);
       if(stIdx < 0) continue;
+
+      // --- NEW: DETECT SL/TP CHANGES FOR JOURNALING (Events 5 & 6) ---
+      // We ignore the initial check (when last == 0) to prevent false alerts on entry
+      if(g_PosStates[stIdx].lastSL != curSL)
+      {
+         if(g_PosStates[stIdx].lastSL != 0.0) 
+         {
+            JournalEvent("SL_CHANGE", ticket, _Symbol, isBuy ? "BUY" : "SELL", posInfo.Volume(), open, curSL, curTP, 0, "SL Modified", "System");
+         }
+         g_PosStates[stIdx].lastSL = curSL;
+      }
+      
+      if(g_PosStates[stIdx].lastTP != curTP)
+      {
+         if(g_PosStates[stIdx].lastTP != 0.0) 
+         {
+            JournalEvent("TP_CHANGE", ticket, _Symbol, isBuy ? "BUY" : "SELL", posInfo.Volume(), open, curSL, curTP, 0, "TP Modified", "System");
+         }
+         g_PosStates[stIdx].lastTP = curTP;
+      }
+      // --------------------------------------------------------------
 
       int totalPartials = ui.partialsCount;
       double step = totalDist / (totalPartials + 1);
@@ -1030,13 +1177,14 @@ void ProcessBasketByType(ENUM_POSITION_TYPE type)
    struct MP { ulong ticket; double profit; double priceDiff; datetime openTime; };
    MP managed[];
 
+   // 1. Gather all managed positions of the specific type (Buy or Sell)
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       if(!posInfo.SelectByIndex(i)) continue;
       if(posInfo.Symbol() != _Symbol) continue;
       if(posInfo.PositionType() != type) continue;
 
-      bool isOwn = (posInfo.Magic() == MAGIC);
+      bool isOwn = (posInfo.Magic() == InpMagicNumber);
       bool isExt = InpMonitorExternal && IsRegisteredExternal(posInfo.Ticket());
       if(!isOwn && !isExt) continue;
 
@@ -1052,20 +1200,25 @@ void ProcessBasketByType(ENUM_POSITION_TYPE type)
       managed[n].openTime = (datetime)posInfo.Time();
    }
 
+   // Require at least 2 trades to trigger basket management
    if(ArraySize(managed) <= 1) return;
 
-   int newestIdx = 0;
+   // 2. Identify ONLY the worst trade (the one with the lowest point difference)
+   int worstIdx = 0;
    for(int i = 1; i < ArraySize(managed); i++)
-      if(managed[i].openTime > managed[newestIdx].openTime) newestIdx = i;
-
-   for(int i = 0; i < ArraySize(managed); i++)
    {
-      if(i == newestIdx) continue;
-      bool green = (g_BasketPts <= 0) ? (managed[i].profit >= 0.0) : (managed[i].priceDiff >= g_BasketPts);
-      if(green) trade.PositionClose(managed[i].ticket);
+      if(managed[i].priceDiff < managed[worstIdx].priceDiff) 
+      {
+         worstIdx = i;
+      }
+   }
+
+   // 3. Execution: The worst entry MUST reach the Edit_GreenPts (g_BasketPts) target independently
+   if(managed[worstIdx].priceDiff >= g_BasketPts && managed[worstIdx].profit > 0.0)
+   {
+      trade.PositionClose(managed[worstIdx].ticket);
    }
 }
-
 //+------------------------------------------------------------------+
 //| EXTERNAL TRADE MONITORING & AUTO-ADOPTION                         |
 //+------------------------------------------------------------------+
@@ -1817,3 +1970,321 @@ void Line(string sfx, double price, color col, ENUM_LINE_STYLE st, int wd, strin
    if(lbl != "") ObjectSetString(0, nm, OBJPROP_TEXT, lbl);
 }
 //+------------------------------------------------------------------+
+
+//+------------------------------------------------------------------+
+//| Escape string for JSON                                           |
+//+------------------------------------------------------------------+
+string EscapeJsonString(string _input)
+{
+   string output = _input;
+   StringReplace(output, "\\", "\\\\");
+   StringReplace(output, "\"", "\\\"");
+   StringReplace(output, "\r", "");
+   StringReplace(output, "\n", " ");
+   return output;
+}
+
+//+------------------------------------------------------------------+
+//| Build JSON Payload                                               |
+//+------------------------------------------------------------------+
+string BuildJSON(string event_name, ulong ticket, string symbol, string side, 
+                 double volume, double price, double sl, double tp, 
+                 double profit, string note, string source, string screenshot_file)
+{
+   string json = "{";
+   json += "\"timestamp\":\"" + EscapeJsonString(TimeToString(TimeCurrent(),TIME_DATE|TIME_SECONDS)) + "\",";
+   json += "\"event\":\"" + EscapeJsonString(event_name) + "\",";
+   json += "\"ticket\":\"" + (string)ticket + "\",";
+   json += "\"symbol\":\"" + EscapeJsonString(symbol) + "\",";
+   json += "\"side\":\"" + EscapeJsonString(side) + "\",";
+   json += "\"volume\":" + DoubleToString(volume,2) + ",";
+   json += "\"price\":" + DoubleToString(price,_Digits) + ",";
+   json += "\"sl\":" + DoubleToString(sl,_Digits) + ",";
+   json += "\"tp\":" + DoubleToString(tp,_Digits) + ",";
+   json += "\"profit\":" + DoubleToString(profit,2) + ",";
+   json += "\"note\":\"" + EscapeJsonString(note) + "\",";
+   json += "\"magic\":\"" + (string)InpMagicNumber + "\",";
+   json += "\"source\":\"" + EscapeJsonString(source) + "\",";
+   json += "\"ea_name\":\"" + EscapeJsonString(APP_SHORT_NAME) + "\",";
+   json += "\"account_login\":\"" + (string)AccountInfoInteger(ACCOUNT_LOGIN) + "\",";
+   json += "\"account_server\":\"" + EscapeJsonString(AccountInfoString(ACCOUNT_SERVER)) + "\",";
+   json += "\"chart_symbol\":\"" + EscapeJsonString(_Symbol) + "\",";
+   json += "\"screenshot_file\":\"" + EscapeJsonString(screenshot_file) + "\"";
+   json += "}";
+   
+   return json;
+}
+
+//+------------------------------------------------------------------+
+//| Take Clean Screenshot (Size & Resolution Optimized)              |
+//+------------------------------------------------------------------+
+string TakeCleanScreenshot(ulong ticket, string event_name)
+{
+   // 1. Move UI out of bounds to hide the panel
+   int total = ObjectsTotal(0, -1, -1);
+   for(int i = 0; i < total; i++)
+   {
+      string name = ObjectName(0, i);
+      if(StringFind(name, g_prefix) == 0) 
+      {
+         long x = ObjectGetInteger(0, name, OBJPROP_XDISTANCE);
+         ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x - 5000); 
+      }
+   }
+   
+   ChartRedraw(0);
+   Sleep(50); 
+   
+   // 2. Generate Filename (.jpg)
+   string filename = "Journal\\" + (string)ticket + "_" + event_name + "_" + TimeToString(TimeCurrent(), TIME_DATE|TIME_MINUTES) + ".jpg";
+   StringReplace(filename, ":", "");
+   StringReplace(filename, ".", "");
+   StringReplace(filename, " ", "_");
+   
+   // 3. Optimize Size: Capture at 30% of the actual screen resolution
+   int chart_w = (int)ChartGetInteger(0, CHART_WIDTH_IN_PIXELS);
+   int chart_h = (int)ChartGetInteger(0, CHART_HEIGHT_IN_PIXELS);
+   
+   int capture_w = (int)(chart_w * 0.30); // 30% of original width
+   int capture_h = (int)(chart_h * 0.30); // 30% of original height
+   
+   // Fallback minimums (prevents the image from being too tiny to read)
+   if(capture_w < 480) capture_w = 480;
+   if(capture_h < 320) capture_h = 320;
+   
+   ChartScreenShot(0, filename, capture_w, capture_h, ALIGN_RIGHT);
+   
+   // 4. Restore UI panel to original position
+   for(int i = 0; i < total; i++)
+   {
+      string name = ObjectName(0, i);
+      if(StringFind(name, g_prefix) == 0)
+      {
+         long x = ObjectGetInteger(0, name, OBJPROP_XDISTANCE);
+         ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x + 5000); 
+      }
+   }
+   ChartRedraw(0);
+   
+   return filename;
+}
+//+------------------------------------------------------------------+
+//| Add Event to Delay Queue (Non-Blocking)                          |
+//+------------------------------------------------------------------+
+void JournalEvent(string event_name, ulong ticket, string symbol, string side, 
+                  double volume, double price, double sl, double tp, 
+                  double profit, string note, string source)
+{
+   if(!InpEnableJournaling) return;
+   
+   int n = ArraySize(g_JournalQueue);
+   ArrayResize(g_JournalQueue, n + 1);
+   
+   // Set the delay (TimeCurrent() + 2 means it will wait 2 seconds)
+   g_JournalQueue[n].trigger_time = TimeCurrent() + 2; 
+   
+   // Store the data
+   g_JournalQueue[n].event_name = event_name;
+   g_JournalQueue[n].ticket = ticket;
+   g_JournalQueue[n].symbol = symbol;
+   g_JournalQueue[n].side = side;
+   g_JournalQueue[n].volume = volume;
+   g_JournalQueue[n].price = price;
+   g_JournalQueue[n].sl = sl;
+   g_JournalQueue[n].tp = tp;
+   g_JournalQueue[n].profit = profit;
+   g_JournalQueue[n].note = note;
+   g_JournalQueue[n].source = source;
+}
+//+------------------------------------------------------------------+
+//| Execute Journal Event Orchestrator                               |
+//+------------------------------------------------------------------+
+void ProcessJournalEvent(string event_name, ulong ticket, string symbol, string side, 
+                  double volume, double price, double sl, double tp, 
+                  double profit, string note, string source)
+{
+   if(!InpEnableJournaling) return;
+
+   string screenshot_file = "";
+   
+   // 1. Take Screenshot ONLY on OPEN
+   if(event_name == "OPEN")
+   {
+      screenshot_file = TakeCleanScreenshot(ticket, event_name);
+   }
+   
+   // 2. Write to CSV
+   string csv_filename = "TM3_Journal.csv";
+   int handle = FileOpen(csv_filename, FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_COMMON, ",");
+   if(handle != INVALID_HANDLE)
+   {
+      if(FileSize(handle) == 0)
+      {
+         FileWrite(handle, "Timestamp", "Event", "Ticket", "Symbol", "Side", "Volume", "Price", "SL", "TP", "Profit", "Note", "Screenshot");
+      }
+      FileSeek(handle, 0, SEEK_END);
+      FileWrite(handle, TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS), event_name, ticket, symbol, side, volume, price, sl, tp, profit, note, screenshot_file);
+      FileClose(handle);
+   }
+
+   // 3. Send Webhook
+   SendJournalWebhook(event_name, ticket, symbol, side, volume, price, sl, tp, profit, note, source, screenshot_file);
+}
+//+------------------------------------------------------------------+
+//| Execute Journal Event via Webhook                                |
+//+------------------------------------------------------------------+
+bool SendJournalWebhook(const string event_name, const ulong ticket, const string symbol, 
+                        const string side, const double volume, const double price, 
+                        const double sl, const double tp, const double profit, 
+                        const string note, const string source, const string screenshot_file)
+{
+   if(InpWebhookURL == "") return false;
+
+   uchar file_data[];
+   bool has_file = ReadScreenshotFileToArray(screenshot_file, file_data);
+
+   // --- MULTIPART/FORM-DATA (For events with screenshots) ---
+   if(has_file)
+   {
+      string boundary = BuildMultipartBoundary();
+      char body[];
+      ArrayResize(body, 0);
+
+      string fields[17][2];
+      fields[0][0] = "timestamp";      fields[0][1] = TimeToString(TimeCurrent(),TIME_DATE|TIME_SECONDS);
+      fields[1][0] = "event";          fields[1][1] = event_name;
+      fields[2][0] = "ticket";         fields[2][1] = (string)ticket;
+      fields[3][0] = "symbol";         fields[3][1] = symbol;
+      fields[4][0] = "side";           fields[4][1] = side;
+      fields[5][0] = "volume";         fields[5][1] = DoubleToString(volume,2);
+      fields[6][0] = "price";          fields[6][1] = DoubleToString(price,_Digits);
+      fields[7][0] = "sl";             fields[7][1] = DoubleToString(sl,_Digits);
+      fields[8][0] = "tp";             fields[8][1] = DoubleToString(tp,_Digits);
+      fields[9][0] = "profit";         fields[9][1] = DoubleToString(profit,2);
+      fields[10][0] = "note";          fields[10][1] = note;
+      fields[11][0] = "magic";         fields[11][1] = (string)InpMagicNumber;
+      fields[12][0] = "source";        fields[12][1] = source;
+      fields[13][0] = "ea_name";       fields[13][1] = APP_SHORT_NAME;
+      fields[14][0] = "account_login"; fields[14][1] = (string)AccountInfoInteger(ACCOUNT_LOGIN);
+      fields[15][0] = "account_server";fields[15][1] = AccountInfoString(ACCOUNT_SERVER);
+      fields[16][0] = "chart_symbol";  fields[16][1] = _Symbol;
+
+      for(int i = 0; i < 17; i++)
+      {
+         CharArrayAppendString(body, "--" + boundary + "\r\n");
+         CharArrayAppendString(body, "Content-Disposition: form-data; name=\"" + fields[i][0] + "\"\r\n\r\n");
+         CharArrayAppendString(body, fields[i][1] + "\r\n");
+      }
+
+      // File Field
+      CharArrayAppendString(body, "--" + boundary + "\r\n");
+      CharArrayAppendString(body, "Content-Disposition: form-data; name=\"screenshot\"; filename=\"" + screenshot_file + "\"\r\n");
+      CharArrayAppendString(body, "Content-Type: image/png\r\n\r\n");
+      CharArrayAppendBytes(body, file_data);
+      CharArrayAppendString(body, "\r\n");
+      CharArrayAppendString(body, "--" + boundary + "--\r\n");
+
+      char response_body[];
+      string response_headers;
+      string headers = "Content-Type: multipart/form-data; boundary=" + boundary + "\r\n";
+
+      ResetLastError();
+      int http_code = WebRequest("POST", InpWebhookURL, headers, 5000, body, response_body, response_headers);
+      
+      if(http_code < 200 || http_code >= 300)
+         Print("[TM3] Multipart Webhook failed. HTTP=", http_code, " Err=", GetLastError());
+      
+      return (http_code >= 200 && http_code < 300);
+   }
+   
+   // --- APPLICATION/JSON (For events without screenshots) ---
+   else 
+   {
+      string payload = BuildJSON(event_name, ticket, symbol, side, volume, price, sl, tp, profit, note, source, "");
+      
+      char request_body[];
+      char response_body[];
+      string response_headers;
+
+      StringToCharArray(payload, request_body, 0, WHOLE_ARRAY, CP_UTF8);
+      if(ArraySize(request_body) > 0) ArrayResize(request_body, ArraySize(request_body)-1); // Remove null terminator
+
+      string headers = "Content-Type: application/json\r\n";
+
+      ResetLastError();
+      int http_code = WebRequest("POST", InpWebhookURL, headers, 5000, request_body, response_body, response_headers);
+      
+      if(http_code < 200 || http_code >= 300)
+         Print("[TM3] JSON Webhook failed. HTTP=", http_code, " Err=", GetLastError());
+         
+      return (http_code >= 200 && http_code < 300);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Webhook Helpers                                                  |
+//+------------------------------------------------------------------+
+string BuildMultipartBoundary()
+{
+   return("----TM3Boundary" + IntegerToString((int)TimeLocal()) + IntegerToString(GetTickCount()));
+}
+
+bool ReadScreenshotFileToArray(const string file_name, uchar &data[])
+{
+   ArrayResize(data, 0);
+   if(StringLen(file_name) <= 0) return false;
+
+   // ChartScreenShot saves into terminal MQL5\Files 
+   int handle = FileOpen(file_name, FILE_READ|FILE_BIN|FILE_SHARE_READ);
+   if(handle == INVALID_HANDLE)
+   {
+      Print("[TM3] Cannot open screenshot '", file_name, "' err=", GetLastError());
+      return false;
+   }
+
+   ulong size = FileSize(handle);
+   if(size == 0 || size > 15000000)
+   {
+      FileClose(handle);
+      Print("[TM3] Screenshot size invalid: ", size);
+      return false;
+   }
+
+   ArrayResize(data, (int)size);
+   uint read = FileReadArray(handle, data, 0, (int)size);
+   FileClose(handle);
+
+   if(read != size)
+   {
+      ArrayResize(data, 0);
+      Print("[TM3] Screenshot read incomplete");
+      return false;
+   }
+
+   return true;
+}
+
+void CharArrayAppendString(char &body[], const string text)
+{
+   uchar tmp[];
+   StringToCharArray(text, tmp, 0, WHOLE_ARRAY, CP_UTF8);
+   int add = ArraySize(tmp);
+   if(add <= 0) return;
+   
+   add--; // Drop trailing '\0'
+   if(add <= 0) return;
+
+   int old = ArraySize(body);
+   ArrayResize(body, old + add);
+   for(int i = 0; i < add; i++) body[old + i] = (char)tmp[i];
+}
+
+void CharArrayAppendBytes(char &body[], const uchar &data[])
+{
+   int add = ArraySize(data);
+   if(add <= 0) return;
+
+   int old = ArraySize(body);
+   ArrayResize(body, old + add);
+   for(int i = 0; i < add; i++) body[old + i] = (char)data[i];
+}
