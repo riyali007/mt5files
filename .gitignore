@@ -12,3 +12,6 @@
 
 # Keep mq4/mq5/mqh files inside Personal folders
 !**/Personal/**/*.mq*
+
+# Keep templates inside template folders
+!**/Profiles/**/*.tpl
