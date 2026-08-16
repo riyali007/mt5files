@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
-//|                                       TradeManager_v3.26.mq5       |
+//|                                       TradeManager_v3.29.mq5       |
 //|   Riy Tech — External trade adoption + per-position BE/Close     |
-//|   v3.26 — Fixed Edit() geometry re-apply causing price box flicker    |
+//|   v3.29 — Removed Auto Risk & Streamlined Interface              |
 //+------------------------------------------------------------------+
 #property copyright "Riy Tech"
-#property version   "3.26"
+#property version   "3.29"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -36,6 +36,7 @@ union ULongToBytes {
    ulong value;
    uchar bytes[8];
 };
+
 //+------------------------------------------------------------------+
 //| INPUTS                                                            |
 //+------------------------------------------------------------------+
@@ -43,15 +44,13 @@ input group "Panel Settings"
 input ENUM_BASE_CORNER InpPanelCorner = CORNER_LEFT_UPPER;
 
 input group "Risk Settings"
-input double InpDefaultLot   = 0.3;   // Default Lot Size
-input int    InpDefaultSL    = 500;   // Default SL (points)
-input int    InpDefaultTP    = 1000;  // Default TP (points)
+input double InpDefaultLot      = 0.3;   // Default Lot Size
+input double InpDefaultRiskPct  = 1.0;   // Default Risk % of Equity
+input int    InpDefaultSL       = 500;   // Default SL (points)
+input int    InpDefaultTP       = 1000;  // Default TP (points)
 
 input group "Inverse Order Settings"
-input int    InpInverseOffset = 50;   // Inverse Pending Offset (points)
-
-input group "Auto Risk Settings"
-input int    InpAutoRiskPartials = 2; // Auto Risk / SL Partials max count
+input int    InpInverseOffset   = 50;   // Inverse Pending Offset (points)
 
 input group "Daily Limits"
 input bool   InpEnableDailyLossLimit = true;
@@ -72,7 +71,7 @@ input int    InpTrailingStart   = 1000;
 input int    InpTrailingStep    = 600;
 
 input group "Sound Settings"
-input bool   InpEnableSounds = true;
+input bool   InpEnableSounds    = true;
 input string InpSoundEntry      = "Ok.wav";
 input string InpSoundOk         = "Ok.wav";
 input string InpSoundPartial    = "News.wav";
@@ -94,18 +93,14 @@ input int    InpMaxOpenTrades = 10;
 input group "Auto Trade Handler"
 input bool   InpBasketEnabled     = true;
 input int    InpBasketGreenPoints = 0;
+input bool   InpWorstAutoSL       = false;  // Auto SL to BE instead of closing worst position
 
-//--- Add under existing input groups ---
 input group "Journaling Settings"
 input bool   InpEnableJournaling = true;
 input string InpWebhookURL       = "https://your-webhook-url.com/endpoint";
 input string APP_SHORT_NAME      = "TM3_Pro";
-input int    InpMagicNumber      = 234567; // Replaces the #define MAGIC
-input int    InpImageQuality     = 50; // Replaces the #define MAGIC
-
-//--- Add to Globals ---
-double g_cached_sl[];
-double g_cached_tp[];
+input int    InpMagicNumber      = 234567;
+input int    InpImageQuality     = 30; // Compressed GDI+ JPEG Quality
 
 //+------------------------------------------------------------------+
 //| CONSTANTS                                                         |
@@ -134,6 +129,7 @@ struct UIState
    ENUM_ORDER_TYPE_UI orderType;
    ENUM_SIDE_UI       side;
    double lotSize;
+   double riskPercent;
    int    slPoints;
    int    tpPoints;
    double slPrice;
@@ -142,8 +138,8 @@ struct UIState
    double customPrice;
    bool   isVisualizing;
    bool   basketEnabled;
+   bool   worstAutoSL;
    bool   inverseEnabled;
-   bool   autoRiskEnabled;
 };
 
 struct ExtTradeRec { ulong ticket; long posID; bool alertSent; bool adopted; };
@@ -153,16 +149,15 @@ struct PosState
    long   posID;
    ulong  ticket;
    int    partialsTaken;
-   int    slPartialsTaken;
    bool   beSet;
-   double lastSL;  // Add this
-   double lastTP;  // Add this
+   double lastSL;
+   double lastTP;
 };
 
 //--- Journaling Queue System ---
 struct JournalTask
 {
-   datetime trigger_time; // When to execute this event
+   datetime trigger_time;
    string   event_name;
    ulong    ticket;
    string   symbol;
@@ -177,6 +172,7 @@ struct JournalTask
 };
 
 JournalTask g_JournalQueue[];
+
 //+------------------------------------------------------------------+
 //| GLOBALS                                                            |
 //+------------------------------------------------------------------+
@@ -193,7 +189,12 @@ PosState      g_PosStates[];
 int           g_PosListX = 0;
 int           g_PosListY = 0;
 ulong         g_SelectedTicket = 0;
-bool          g_HasOpenTrades = false;  // Set by OnTradeTransaction, checked cheaply every tick
+bool          g_HasOpenTrades = false;
+
+// Caching symbol tick values
+double        g_TickValue = 0.0;
+double        g_TickSize  = 0.0;
+double        g_PointMult = 0.0;
 
 //+------------------------------------------------------------------+
 //| FORWARD DECLARATIONS                                              |
@@ -241,15 +242,29 @@ bool   IsManagedPosition();
 int    CountManagedOpenPositions();
 double NormaliseSL(double price);
 void   ToggleBasket();
+void   ToggleWorstAutoSL();
 void   DrawPositionList(int x, int y);
 void   RefreshPositionList();
 int    PositionListHeight();
 void   ExportToCSV();
+void   RecalculateLotFromRisk();
+void   RecalculateRiskFromLot();
+void   UpdateSymbolCache();
 void   Btn (string n, int x, int y, int w, int h, string t, bool act, color b = COLOR_BTN);
 void   Rect(string n, int x, int y, int w, int h, color bg);
 void   Edit(string n, int x, int y, int w, int h, string t);
 void   Lbl (string n, int x, int y, string t);
 void   Line(string sfx, double price, color col, ENUM_LINE_STYLE st, int wd, string lbl = "");
+string TakeCleanScreenshot(ulong ticket, string event_name);
+string BuildJSON(string event_name, ulong ticket, string symbol, string side, double volume, double price, double sl, double tp, double profit, string note, string source, string screenshot_file);
+bool   SendJournalWebhook(const string event_name, const ulong ticket, const string symbol, const string side, const double volume, const double price, const double sl, const double tp, const double profit, const string note, const string source, const string screenshot_file);
+string BuildMultipartBoundary();
+bool   ReadScreenshotFileToArray(const string file_name, uchar &data[]);
+void   CharArrayAppendString(char &body[], const string text);
+void   CharArrayAppendBytes(char &body[], const uchar &data[]);
+bool   CompressJPEG(string inputFile, string outputFile, uint qualityLevel);
+void   JournalEvent(string event_name, ulong ticket, string symbol, string side, double volume, double price, double sl, double tp, double profit, string note, string source);
+void   ProcessJournalEvent(string event_name, ulong ticket, string symbol, string side, double volume, double price, double sl, double tp, double profit, string note, string source);
 
 //+------------------------------------------------------------------+
 //| INIT / DEINIT                                                      |
@@ -260,15 +275,20 @@ int OnInit()
    ui.orderType = UI_MARKET;
    ui.side = UI_BUY;
    ui.lotSize = InpDefaultLot;
+   ui.riskPercent = InpDefaultRiskPct;
    ui.slPoints = InpDefaultSL;
    ui.tpPoints = InpDefaultTP;
    ui.partialsCount = InpDefaultPartial;
    ui.isVisualizing = false;
    ui.basketEnabled = InpBasketEnabled;
+   ui.worstAutoSL   = InpWorstAutoSL;
    ui.customPrice = 0;
    g_BasketPts = InpBasketGreenPoints;
 
+   UpdateSymbolCache();
    LoadState();
+   RecalculateLotFromRisk(); 
+
    trade.SetExpertMagicNumber(MAGIC);
    SyncPosStates();
 
@@ -276,9 +296,10 @@ int OnInit()
    RebuildPanel(true);
    UpdateSLTPPrices(SymbolInfoDouble(_Symbol, SYMBOL_ASK));
 
-   PrintFormat("[TM3 v3.26] Ready | BE after Partial#%d (+%dpts) | Trailing=%s | AutoAdoptExternal=%s",
-               InpBE_Trigger, InpBE_Offset, InpUseTrailingStop ? "ON" : "OFF", InpAutoAdoptExternal ? "ON" : "OFF");
-   EventSetTimer(1);// Starts a 1-second background timer for the queue
+   PrintFormat("[TM3 v3.29] Ready | BE after Partial#%d (+%dpts) | Trailing=%s | AutoAdoptExternal=%s | WorstAutoSL=%s",
+               InpBE_Trigger, InpBE_Offset, InpUseTrailingStop ? "ON" : "OFF", 
+               InpAutoAdoptExternal ? "ON" : "OFF", ui.worstAutoSL ? "ON" : "OFF");
+   EventSetTimer(1);
    return INIT_SUCCEEDED;
 }
 
@@ -292,16 +313,62 @@ void OnDeinit(const int reason)
    ObjectsDeleteAll(0, g_prefix);
    ArrayFree(g_ExtTrades);
    ArrayFree(g_PosStates);
-   EventKillTimer(); // Clean up the timer when the EA is removed
+   EventKillTimer();
 }
 
 //+------------------------------------------------------------------+
-//| ON TICK                                                            |
+//| SYMBOL CACHE FOR PERFORMANCE                                     |
 //+------------------------------------------------------------------+
-// PERFORMANCE: Instead of calling PositionsTotal() (which still has to touch
-// the trade environment) or looping arrays every single tick, we maintain a
-// simple boolean flag that's updated only when a trade actually opens/closes.
-// This event fires on deal execution -- far less frequently than OnTick.
+void UpdateSymbolCache()
+{
+   g_TickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   g_TickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(g_TickSize > 0 && _Point > 0)
+      g_PointMult = (_Point / g_TickSize) * g_TickValue;
+   else
+      g_PointMult = 1.0;
+}
+
+//+------------------------------------------------------------------+
+//| RISK % AND LOT SIZE CALCULATION HELPERS                          |
+//+------------------------------------------------------------------+
+void RecalculateLotFromRisk()
+{
+   UpdateSymbolCache();
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(equity <= 0 || ui.slPoints <= 0 || g_PointMult <= 0) return;
+
+   double riskAmount = equity * (ui.riskPercent / 100.0);
+   double calculatedLot = riskAmount / (ui.slPoints * g_PointMult);
+
+   double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double stepLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   calculatedLot = MathFloor(calculatedLot / stepLot) * stepLot;
+   calculatedLot = MathMax(minLot, MathMin(maxLot, calculatedLot));
+
+   ui.lotSize = NormalizeDouble(calculatedLot, 2);
+   if(ObjectFind(0, g_prefix + "Edit_Lot") >= 0)
+      ObjectSetString(0, g_prefix + "Edit_Lot", OBJPROP_TEXT, DoubleToString(ui.lotSize, 2));
+}
+
+void RecalculateRiskFromLot()
+{
+   UpdateSymbolCache();
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(equity <= 0 || ui.slPoints <= 0 || g_PointMult <= 0) return;
+
+   double riskAmount = ui.lotSize * ui.slPoints * g_PointMult;
+   ui.riskPercent = NormalizeDouble((riskAmount / equity) * 100.0, 2);
+
+   if(ObjectFind(0, g_prefix + "Edit_RiskPct") >= 0)
+      ObjectSetString(0, g_prefix + "Edit_RiskPct", OBJPROP_TEXT, DoubleToString(ui.riskPercent, 2));
+}
+
+//+------------------------------------------------------------------+
+//| ON TRADE TRANSACTION                                             |
+//+------------------------------------------------------------------+
 void OnTradeTransaction(const MqlTradeTransaction &trans,
                          const MqlTradeRequest &request,
                          const MqlTradeResult &result)
@@ -319,47 +386,63 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
          double vol = HistoryDealGetDouble(trans.deal, DEAL_VOLUME);
          double price = HistoryDealGetDouble(trans.deal, DEAL_PRICE);
          
-         // Event 1: OPEN (Screenshot Taken)
          if(entry == DEAL_ENTRY_IN)
          {
-            // For entry deals, the deal type is the actual position type.
             string side = (type == DEAL_TYPE_BUY) ? "BUY" : "SELL";
             JournalEvent("OPEN", ticket, symbol, side, vol, price, 0, 0, 0, "Trade Opened", "System");
          }
-         // Events 2, 3, 4, etc: OUT Deals (No Screenshot)
          else if(entry == DEAL_ENTRY_OUT)
          {
-            // CRITICAL FIX: An OUT deal of type SELL means the original position was a BUY. 
-            // We invert it here so the journal records the ACTUAL side of the original trade.
             string actual_side = (type == DEAL_TYPE_SELL) ? "BUY" : "SELL";
-            
             double profit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT) + HistoryDealGetDouble(trans.deal, DEAL_COMMISSION) + HistoryDealGetDouble(trans.deal, DEAL_SWAP);
             long reason = HistoryDealGetInteger(trans.deal, DEAL_REASON);
             
             string event_type = "";
             
-            // Check if position still exists (meaning only a part of the volume was closed)
             if(PositionSelectByTicket(ticket)) 
             {
                event_type = "PARTIAL";
             }
             else
             {
-               // If the broker closed it because the physical Stop Loss was hit
-               if(reason == DEAL_REASON_SL)
+               ulong order_ticket = HistoryDealGetInteger(trans.deal, DEAL_ORDER);
+               double order_sl = 0;
+               double order_tp = 0;
+               if(HistoryOrderSelect(order_ticket))
+               {
+                  order_sl = HistoryOrderGetDouble(order_ticket, ORDER_SL);
+                  order_tp = HistoryOrderGetDouble(order_ticket, ORDER_TP);
+               }
+               
+               bool is_sl_hit = (reason == DEAL_REASON_SL);
+               bool is_tp_hit = (reason == DEAL_REASON_TP);
+               
+               if(!is_sl_hit && !is_tp_hit)
+               {
+                  if(order_sl > 0)
+                  {
+                     if(actual_side == "BUY" && price <= order_sl) is_sl_hit = true;
+                     if(actual_side == "SELL" && price >= order_sl) is_sl_hit = true;
+                  }
+                  if(order_tp > 0)
+                  {
+                     if(actual_side == "BUY" && price >= order_tp) is_tp_hit = true;
+                     if(actual_side == "SELL" && price <= order_tp) is_tp_hit = true;
+                  }
+               }
+
+               if(is_sl_hit)
                {
                   if(profit < 0) event_type = "SL_Hit";
-                  else event_type = "BE_Hit"; // Positive or 0 profit SL is a Breakeven/Trailing Stop
+                  else event_type = "BE_Hit";
                }
-               // If the broker closed it because the Take Profit was hit
-               else if(reason == DEAL_REASON_TP)
+               else if(is_tp_hit)
                {
                   event_type = "TP_Hit";
                }
-               // If closed manually by the user OR automatically by the EA (like the Basket logic)
                else 
                {
-                  event_type = "CLOSE";
+                  event_type = "Manually_Closed";
                }
             }
             
@@ -378,6 +461,9 @@ void RecomputeHasOpenTrades()
    g_HasOpenTrades = (PositionsTotal() > 0);
 }
 
+//+------------------------------------------------------------------+
+//| ON TICK                                                            |
+//+------------------------------------------------------------------+
 void OnTick()
 {
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
@@ -414,17 +500,6 @@ void OnTick()
       }
    }
 
-   // --- Trade Management ---
-   // PERFORMANCE: PositionsTotal() is a cheap O(1)-ish call. If there are zero
-   // positions on the account, none of the management functions have anything
-   // to do -- skip them entirely instead of paying for their internal loops
-   // and ObjectFind/ObjectCreate calls every tick. This was the main source of
-   // the input-delay regression: management funcs kept doing work (and touching
-   // chart objects) even with a flat book.
-   // PERFORMANCE: g_HasOpenTrades is a plain boolean maintained by
-   // OnTradeTransaction() -- checking it costs nothing (no function call,
-   // no loop), unlike PositionsTotal() which touches the trade environment
-   // on every single tick. This was the last remaining per-tick overhead.
    if(g_HasOpenTrades)
    {
       ScanExternalTrades();
@@ -434,18 +509,9 @@ void OnTick()
    }
    else if(InpMonitorExternal)
    {
-      // Still need the 1s-throttled external scan even with zero *managed* trades,
-      // in case a brand-new external trade just appeared -- but this is cheap
-      // and already internally throttled to 1x/sec. ScanExternalTrades() itself
-      // will flip g_HasOpenTrades true via RecomputeHasOpenTrades() once it adopts one.
       ScanExternalTrades();
    }
 
-   // Refresh the position list roughly 2x/sec (cheap enough, ticket count is small)
-   // NOTE: This must NOT call RebuildPanel()/CreatePanelElements() -- that recreates
-   // Edit_Price/Edit_SL_Prc/Edit_TP_Prc with hardcoded "0.00000" text, which was
-   // fighting with the live price update loop above and causing visible flicker.
-   // RefreshPositionList() only touches the position-list rows.
    static ulong lastPosListMs = 0;
    static bool wasFlat = true;
    if(nowMs - lastPosListMs >= 500)
@@ -454,8 +520,6 @@ void OnTick()
 
       if(!g_HasOpenTrades)
       {
-         // Nothing to manage or display -- only clear the list once when we
-         // transition from "had trades" to "flat", not on every cycle.
          if(!wasFlat)
          {
             g_SelectedTicket = 0;
@@ -481,7 +545,6 @@ void OnTick()
       }
    }
 
-   // Run cleanup unconditionally every 3 seconds to catch the final closing trade
    static datetime lastCleanup = 0;
    if(TimeCurrent() - lastCleanup >= 3)
    {
@@ -489,8 +552,9 @@ void OnTick()
       lastCleanup = TimeCurrent();
    }
 }
+
 //+------------------------------------------------------------------+
-//| Background Timer for Asynchronous Queue                          |
+//| BACKGROUND TIMER FOR ASYNCHRONOUS QUEUE                          |
 //+------------------------------------------------------------------+
 void OnTimer()
 {
@@ -499,10 +563,8 @@ void OnTimer()
    
    datetime now = TimeCurrent();
    
-   // Check if the oldest task in the queue is ready to trigger
    if(now >= g_JournalQueue[0].trigger_time)
    {
-      // Execute the heavy processing (Screenshot, CSV, Webhook)
       ProcessJournalEvent(
          g_JournalQueue[0].event_name, g_JournalQueue[0].ticket, g_JournalQueue[0].symbol, 
          g_JournalQueue[0].side, g_JournalQueue[0].volume, g_JournalQueue[0].price, 
@@ -510,7 +572,6 @@ void OnTimer()
          g_JournalQueue[0].note, g_JournalQueue[0].source
       );
                    
-      // Remove the executed event from the queue and shift the rest up
       for(int i = 0; i < n - 1; i++)
       {
          g_JournalQueue[i] = g_JournalQueue[i + 1];
@@ -518,6 +579,7 @@ void OnTimer()
       ArrayResize(g_JournalQueue, n - 1);
    }
 }
+
 //+------------------------------------------------------------------+
 //| CHART EVENTS                                                       |
 //+------------------------------------------------------------------+
@@ -545,28 +607,35 @@ void OnChartEvent(const int id, const long &lp, const double &dp, const string &
          ObjectSetString(0, g_prefix + "Edit_Price", OBJPROP_TEXT, DoubleToString(ui.customPrice, _Digits));
          UpdatePanelUI(); SaveState();
       }
-      if(sp == g_prefix + "Btn_Buy")  { ui.side = UI_BUY;  UpdatePanelUI(); ExecuteOrder(); SaveState(); }
-      if(sp == g_prefix + "Btn_Sell") { ui.side = UI_SELL; UpdatePanelUI(); ExecuteOrder(); SaveState(); }
-      if(sp == g_prefix + "Btn_Vis")  { ToggleVisualization(); }
-      if(sp == g_prefix + "Btn_Part") { ManualPartial(); }
-      if(sp == g_prefix + "Btn_BE")   { SetBreakEvenManual(); }
-      if(sp == g_prefix + "Btn_CloseAll") { CloseAll(); }
-      if(sp == g_prefix + "Btn_Export")   { ExportToCSV(); }
-      if(sp == g_prefix + "Btn_Inverse")  { ui.inverseEnabled = !ui.inverseEnabled; UpdatePanelUI(); SaveState(); }
-      if(sp == g_prefix + "Btn_AutoRisk") { ui.autoRiskEnabled = !ui.autoRiskEnabled; UpdatePanelUI(); SaveState(); }
-      if(sp == g_prefix + "Btn_Basket")   { ToggleBasket(); }
-      if(sp == g_prefix + "Btn_SelPrev")  { CycleSelectedTrade(-1); }
-      if(sp == g_prefix + "Btn_SelNext")  { CycleSelectedTrade(1); }
-      if(sp == g_prefix + "Btn_CloseSel") { CloseSelectedTrade(); }
-
-      // (Per-row BE/Close buttons removed in v3.22 -- replaced by the Trade Selector
-      // + Partial/BE/Close-Selected buttons, which scale to any number of trades.)
+      if(sp == g_prefix + "Btn_Buy")     { ui.side = UI_BUY;  UpdatePanelUI(); ExecuteOrder(); SaveState(); }
+      if(sp == g_prefix + "Btn_Sell")    { ui.side = UI_SELL; UpdatePanelUI(); ExecuteOrder(); SaveState(); }
+      if(sp == g_prefix + "Btn_Vis")     { ToggleVisualization(); }
+      if(sp == g_prefix + "Btn_Part")    { ManualPartial(); }
+      if(sp == g_prefix + "Btn_BE")      { SetBreakEvenManual(); }
+      if(sp == g_prefix + "Btn_CloseAll"){ CloseAll(); }
+      if(sp == g_prefix + "Btn_Export")  { ExportToCSV(); }
+      if(sp == g_prefix + "Btn_Inverse") { ui.inverseEnabled = !ui.inverseEnabled; UpdatePanelUI(); SaveState(); }
+      if(sp == g_prefix + "Btn_Basket")  { ToggleBasket(); }
+      if(sp == g_prefix + "Btn_WorstSL") { ToggleWorstAutoSL(); }
+      if(sp == g_prefix + "Btn_SelPrev") { CycleSelectedTrade(-1); }
+      if(sp == g_prefix + "Btn_SelNext") { CycleSelectedTrade(1); }
+      if(sp == g_prefix + "Btn_CloseSel"){ CloseSelectedTrade(); }
    }
 
    if(id == CHARTEVENT_OBJECT_ENDEDIT)
    {
       double entry = (ui.orderType == UI_LIMIT) ? ui.customPrice : ((ui.side == UI_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID));
-      if(sp == g_prefix + "Edit_Lot") ui.lotSize = StringToDouble(ObjectGetString(0, sp, OBJPROP_TEXT));
+      
+      if(sp == g_prefix + "Edit_RiskPct")
+      {
+         ui.riskPercent = StringToDouble(ObjectGetString(0, sp, OBJPROP_TEXT));
+         RecalculateLotFromRisk();
+      }
+      if(sp == g_prefix + "Edit_Lot")
+      {
+         ui.lotSize = StringToDouble(ObjectGetString(0, sp, OBJPROP_TEXT));
+         RecalculateRiskFromLot();
+      }
       if(sp == g_prefix + "Edit_Part")
       {
          ui.partialsCount = (int)StringToInteger(ObjectGetString(0, sp, OBJPROP_TEXT));
@@ -581,6 +650,7 @@ void OnChartEvent(const int id, const long &lp, const double &dp, const string &
       if(sp == g_prefix + "Edit_SL")
       {
          ui.slPoints = (int)StringToInteger(ObjectGetString(0, sp, OBJPROP_TEXT));
+         RecalculateLotFromRisk();
          UpdateSLTPPrices(entry);
       }
       if(sp == g_prefix + "Edit_TP")
@@ -592,7 +662,12 @@ void OnChartEvent(const int id, const long &lp, const double &dp, const string &
       if(sp == g_prefix + "Edit_SL_Prc")
       {
          double p = StringToDouble(ObjectGetString(0, sp, OBJPROP_TEXT));
-         if(entry > 0) { ui.slPoints = (int)MathAbs((entry - p) / _Point); ObjectSetString(0, g_prefix + "Edit_SL", OBJPROP_TEXT, IntegerToString(ui.slPoints)); }
+         if(entry > 0) 
+         { 
+            ui.slPoints = (int)MathAbs((entry - p) / _Point); 
+            ObjectSetString(0, g_prefix + "Edit_SL", OBJPROP_TEXT, IntegerToString(ui.slPoints)); 
+            RecalculateLotFromRisk();
+         }
       }
       if(sp == g_prefix + "Edit_TP_Prc")
       {
@@ -625,11 +700,11 @@ void EnsurePosState(long posID, ulong ticket)
    g_PosStates[n].posID = posID;
    g_PosStates[n].ticket = ticket;
    g_PosStates[n].partialsTaken = 0;
-   g_PosStates[n].slPartialsTaken = 0;
    g_PosStates[n].beSet = false;
-   g_PosStates[n].lastSL = 0.0; // Initialize
-   g_PosStates[n].lastTP = 0.0; // Initialize
+   g_PosStates[n].lastSL = 0.0;
+   g_PosStates[n].lastTP = 0.0;
 }
+
 void RemovePosState(long posID)
 {
    int idx = FindPosStateIdx(posID);
@@ -715,7 +790,6 @@ void ManagePositions()
       double curTP = posInfo.TakeProfit();
       bool   isBuy = (posInfo.PositionType() == POSITION_TYPE_BUY);
 
-      // If an external trade still has no TP (adoption failed/disabled), skip partial math
       if(tp == 0.0) continue;
 
       double totalDist = MathAbs(tp - open);
@@ -725,11 +799,9 @@ void ManagePositions()
       int stIdx = FindPosStateIdx(pid);
       if(stIdx < 0) continue;
 
-      // --- NEW: DETECT SL/TP CHANGES FOR JOURNALING (Events 5 & 6) ---
-      // We ignore the initial check (when last == 0) to prevent false alerts on entry
       if(g_PosStates[stIdx].lastSL != curSL)
       {
-         if(g_PosStates[stIdx].lastSL != 0.0) 
+         if(g_PosStates[stIdx].lastSL != 0.0 && g_PosStates[stIdx].beSet==false) 
          {
             JournalEvent("SL_CHANGE", ticket, _Symbol, isBuy ? "BUY" : "SELL", posInfo.Volume(), open, curSL, curTP, 0, "SL Modified", "System");
          }
@@ -744,7 +816,6 @@ void ManagePositions()
          }
          g_PosStates[stIdx].lastTP = curTP;
       }
-      // --------------------------------------------------------------
 
       int totalPartials = ui.partialsCount;
       double step = totalDist / (totalPartials + 1);
@@ -783,40 +854,6 @@ void ManagePositions()
       g_PosStates[stIdx].partialsTaken = nextPartial;
       if(InpEnableSounds) PlaySound(InpSoundPartial);
 
-      // --- AUTO RISK SL SCALING ---
-      if(ui.autoRiskEnabled && curSL > 0)
-      {
-         double minV2 = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-         double slDist = MathAbs(open - curSL);
-         double slStep = slDist / 2.0;
-         int slTaken = g_PosStates[stIdx].slPartialsTaken;
-         int nextSLPartial = slTaken + 1;
-         if(nextSLPartial <= 2)
-         {
-            double nextSLLvl = isBuy ? open - slStep * nextSLPartial : open + slStep * nextSLPartial;
-            bool crossedSL = isBuy ? (curr <= nextSLLvl) : (curr >= nextSLLvl);
-            if(crossedSL)
-            {
-               if(nextSLPartial >= 2)
-               {
-                  trade.PositionClose(ticket);
-                  continue;
-               }
-               else
-               {
-                  double slAmt = NormalizeDouble(posInfo.Volume() / 2.0, 2);
-                  if(slAmt < minV2) slAmt = minV2;
-                  if(slAmt > posInfo.Volume()) slAmt = posInfo.Volume();
-                  if(trade.PositionClosePartial(ticket, slAmt))
-                  {
-                     g_PosStates[stIdx].slPartialsTaken = nextSLPartial;
-                     if(InpEnableSounds) PlaySound(InpSoundSL);
-                  }
-               }
-            }
-         }
-      }
-
       if(InpBE_Trigger > 0 && nextPartial == InpBE_Trigger && !beSet)
       {
          if(posInfo.SelectByTicket(ticket))
@@ -837,13 +874,13 @@ void ManagePositions()
             {
                g_PosStates[stIdx].beSet = true;
             }
+            
+            if (g_PosStates[stIdx].beSet)
+               JournalEvent("SL_CHANGE", ticket, _Symbol, isBuy ? "BUY" : "SELL", posInfo.Volume(), open, curSL, curTP, 0, "SL Set to BE", "System");
          }
       }
    }
 
-   // Safety net: this function only runs when g_HasOpenTrades is true, and it's
-   // already throttled to 200ms -- so this recheck is cheap and catches any
-   // close (full SL-scale-out close, manual close, etc.) that happened this cycle.
    RecomputeHasOpenTrades();
 }
 
@@ -854,10 +891,6 @@ void ManageTrailingStop()
 {
    if(!InpUseTrailingStop) return;
 
-   // PERFORMANCE: throttle to 5x/sec instead of running on every single tick.
-   // Trailing-stop math doesn't need tick-level precision -- 200ms granularity
-   // is imperceptible to the strategy but meaningfully reduces CPU load on
-   // fast-moving symbols with high tick frequency.
    static ulong lastTrailMs = 0;
    ulong nowMsT = (ulong)GetTickCount();
    if(nowMsT - lastTrailMs < 200) return;
@@ -972,14 +1005,8 @@ double NormaliseVolume(double vol)
    return MathFloor(vol / step) * step;
 }
 
-//+------------------------------------------------------------------+
-//| MANUAL ACTIONS (fallback single-position, kept for compatibility) |
-//+------------------------------------------------------------------+
 void SetBreakEvenManual()
 {
-   // Now acts on the currently SELECTED trade (from the trade-selector control)
-   // instead of whatever posInfo.Select(_Symbol) happens to return, which is
-   // ambiguous when multiple trades are open on the same symbol.
    if(g_SelectedTicket == 0)
    {
       Alert("[TM3] No trade selected. Use the Trade Selector to pick a ticket first.");
@@ -1013,9 +1040,6 @@ void CloseTicket(ulong ticket)
 
 void ManualPartial()
 {
-   // Now acts on the currently SELECTED trade instead of an ambiguous
-   // posInfo.Select(_Symbol), which previously always grabbed the same
-   // (arbitrary) position when multiple trades were open.
    if(g_SelectedTicket == 0)
    {
       Alert("[TM3] No trade selected. Use the Trade Selector to pick a ticket first.");
@@ -1034,8 +1058,6 @@ void ManualPartial()
       if(InpEnableSounds) PlaySound(InpSoundPartial);
 }
 
-// CloseAll now closes ALL managed positions -- both internal (Magic==MAGIC)
-// AND adopted external trades -- plus deletes internal pending orders.
 void CloseAll()
 {
    bool any = false;
@@ -1058,15 +1080,6 @@ void CloseAll()
    if(any && InpEnableSounds) PlaySound(InpSoundClose);
 }
 
-//+------------------------------------------------------------------+
-//| TRADE SELECTOR (multi-trade manual actions)                       |
-//+------------------------------------------------------------------+
-// Builds an ordered list of managed ticket numbers (own + adopted external),
-// consistent ordering by ticket ascending, so cycling is stable/predictable.
-// PERFORMANCE: g_ManagedTickets is rebuilt once per management cycle (via
-// RefreshManagedTicketCache(), called from OnTick's throttled refresh) instead
-// of being rebuilt from scratch on every selector click / validation call.
-// This avoids 2-3 redundant PositionsTotal() loops per user interaction.
 ulong g_ManagedTickets[];
 datetime g_ManagedTicketsCacheTime = 0;
 
@@ -1088,8 +1101,6 @@ int BuildManagedTicketList(ulong &list[])
    return ArraySize(list);
 }
 
-// Refreshes the cached ticket list. Cheap to call frequently (small arrays),
-// but calling it once per cycle instead of 2-3x per click still saves work.
 void RefreshManagedTicketCache()
 {
    BuildManagedTicketList(g_ManagedTickets);
@@ -1103,7 +1114,6 @@ int FindManagedTicketIndex(ulong ticket)
    return -1;
 }
 
-// offset = +1 (next) or -1 (previous); wraps around
 ulong GetManagedTicketByOffset(int offset)
 {
    int n = ArraySize(g_ManagedTickets);
@@ -1119,16 +1129,12 @@ ulong GetManagedTicketByOffset(int offset)
 
 void CycleSelectedTrade(int direction)
 {
-   // Refresh cache on-demand here too (user click), cheap for typical trade counts,
-   // ensures selector never acts on stale data even between the 500ms refresh ticks.
    RefreshManagedTicketCache();
    ulong t = GetManagedTicketByOffset(direction);
    g_SelectedTicket = t;
    UpdateSelectedTradeLabel();
 }
 
-// Called whenever positions open/close so the selector stays valid
-// (e.g. if the selected ticket was closed, auto-advance to another one).
 void ValidateSelectedTicket()
 {
    int n = ArraySize(g_ManagedTickets);
@@ -1184,12 +1190,17 @@ void ToggleBasket()
    SaveState();
 }
 
+void ToggleWorstAutoSL()
+{
+   ui.worstAutoSL = !ui.worstAutoSL;
+   UpdatePanelUI();
+   SaveState();
+}
+
 void ManageDrawdownBasket()
 {
    if(!ui.basketEnabled) return;
 
-   // PERFORMANCE: throttle to 5x/sec -- basket close decisions are based on
-   // profit/point thresholds that don't need tick-level granularity.
    static ulong lastBasketMs = 0;
    ulong nowMsB = (ulong)GetTickCount();
    if(nowMsB - lastBasketMs < 200) return;
@@ -1204,7 +1215,6 @@ void ProcessBasketByType(ENUM_POSITION_TYPE type)
    struct MP { ulong ticket; double profit; double priceDiff; datetime openTime; };
    MP managed[];
 
-   // 1. Gather all managed positions of the specific type (Buy or Sell)
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       if(!posInfo.SelectByIndex(i)) continue;
@@ -1227,10 +1237,8 @@ void ProcessBasketByType(ENUM_POSITION_TYPE type)
       managed[n].openTime = (datetime)posInfo.Time();
    }
 
-   // Require at least 2 trades to trigger basket management
    if(ArraySize(managed) <= 1) return;
 
-   // 2. Identify ONLY the worst trade (the one with the lowest point difference)
    int worstIdx = 0;
    for(int i = 1; i < ArraySize(managed); i++)
    {
@@ -1240,12 +1248,32 @@ void ProcessBasketByType(ENUM_POSITION_TYPE type)
       }
    }
 
-   // 3. Execution: The worst entry MUST reach the Edit_GreenPts (g_BasketPts) target independently
    if(managed[worstIdx].priceDiff >= g_BasketPts && managed[worstIdx].profit > 0.0)
    {
-      trade.PositionClose(managed[worstIdx].ticket);
+      if(ui.worstAutoSL)
+      {
+         if(PositionSelectByTicket(managed[worstIdx].ticket))
+         {
+            double open = posInfo.PriceOpen();
+            bool isBuy = (posInfo.PositionType() == POSITION_TYPE_BUY);
+            double targetBE = NormaliseSL(isBuy ? open + InpBE_Offset * _Point : open - InpBE_Offset * _Point);
+            double curSL = posInfo.StopLoss();
+
+            bool isBEAlready = isBuy ? (curSL >= targetBE) : (curSL > 0 && curSL <= targetBE);
+
+            if(!isBEAlready)
+            {
+               SetBreakEvenTicket(managed[worstIdx].ticket);
+            }
+         }
+      }
+      else
+      {
+         trade.PositionClose(managed[worstIdx].ticket);
+      }
    }
 }
+
 //+------------------------------------------------------------------+
 //| EXTERNAL TRADE MONITORING & AUTO-ADOPTION                         |
 //+------------------------------------------------------------------+
@@ -1285,14 +1313,10 @@ void ScanExternalTrades()
       if(InpAutoAdoptExternal)
          AdoptExternalTrade(ticket);
 
-      g_HasOpenTrades = true; // safety net alongside OnTradeTransaction
+      g_HasOpenTrades = true;
    }
 }
 
-// Applies default SL/TP to an external trade so it enters the same
-// partial/BE/trailing pipeline as internally-opened trades.
-// By default only fills in MISSING SL/TP (does not override a manually-set stop),
-// unless InpOverwriteExtSLTP is enabled.
 void AdoptExternalTrade(ulong ticket)
 {
    if(!PositionSelectByTicket(ticket)) return;
@@ -1325,8 +1349,6 @@ void AdoptExternalTrade(ulong ticket)
       if(trade.PositionModify(ticket, newSL, newTP))
       {
          Print("[TM3] Adopted external ticket ", ticket, " — SL=", newSL, " TP=", newTP);
-         int idx = ArraySize(g_ExtTrades) - 1;
-         // find matching record and mark adopted
          for(int i = 0; i < ArraySize(g_ExtTrades); i++)
             if(g_ExtTrades[i].ticket == ticket) { g_ExtTrades[i].adopted = true; break; }
       }
@@ -1438,7 +1460,6 @@ bool IsManagedPosition()
 
 int CountManagedOpenPositions()
 {
-   // FAST PATH: if the account is completely flat, skip the loop entirely.
    if(PositionsTotal() == 0) return 0;
    int count = 0;
    for(int i = PositionsTotal() - 1; i >= 0; i--)
@@ -1484,12 +1505,13 @@ void SaveState()
    GlobalVariableSet("TM3_" + id + "_Type", (double)ui.orderType);
    GlobalVariableSet("TM3_" + id + "_Side", (double)ui.side);
    GlobalVariableSet("TM3_" + id + "_Lot", ui.lotSize);
+   GlobalVariableSet("TM3_" + id + "_RiskPct", ui.riskPercent);
    GlobalVariableSet("TM3_" + id + "_SL", (double)ui.slPoints);
    GlobalVariableSet("TM3_" + id + "_TP", (double)ui.tpPoints);
    GlobalVariableSet("TM3_" + id + "_Parts", (double)ui.partialsCount);
    GlobalVariableSet("TM3_" + id + "_Basket", (double)ui.basketEnabled);
+   GlobalVariableSet("TM3_" + id + "_WorstSL", (double)ui.worstAutoSL);
    GlobalVariableSet("TM3_" + id + "_Inv", (double)ui.inverseEnabled);
-   GlobalVariableSet("TM3_" + id + "_AutoRisk", (double)ui.autoRiskEnabled);
 }
 
 void LoadState()
@@ -1499,39 +1521,35 @@ void LoadState()
    ui.orderType = (ENUM_ORDER_TYPE_UI)(int)GlobalVariableGet("TM3_" + id + "_Type");
    ui.side = (ENUM_SIDE_UI) (int)GlobalVariableGet("TM3_" + id + "_Side");
    ui.lotSize = GlobalVariableGet("TM3_" + id + "_Lot");
+   if(GlobalVariableCheck("TM3_" + id + "_RiskPct")) ui.riskPercent = GlobalVariableGet("TM3_" + id + "_RiskPct");
    ui.slPoints = (int) GlobalVariableGet("TM3_" + id + "_SL");
    ui.tpPoints = (int) GlobalVariableGet("TM3_" + id + "_TP");
    ui.partialsCount = (int) GlobalVariableGet("TM3_" + id + "_Parts");
    if(GlobalVariableCheck("TM3_" + id + "_Basket")) ui.basketEnabled = (bool)GlobalVariableGet("TM3_" + id + "_Basket");
+   if(GlobalVariableCheck("TM3_" + id + "_WorstSL")) ui.worstAutoSL = (bool)GlobalVariableGet("TM3_" + id + "_WorstSL");
    if(GlobalVariableCheck("TM3_" + id + "_Inv")) ui.inverseEnabled = (bool)GlobalVariableGet("TM3_" + id + "_Inv");
-   if(GlobalVariableCheck("TM3_" + id + "_AutoRisk")) ui.autoRiskEnabled = (bool)GlobalVariableGet("TM3_" + id + "_AutoRisk");
 }
 
 void ClearState()
 {
    string id = IntegerToString(ChartID());
-   string keys[] = {"_Type","_Side","_Lot","_SL","_TP","_Parts","_Basket"};
-   for(int i = 0; i < 7; i++) GlobalVariableDel("TM3_" + id + keys[i]);
+   string keys[] = {"_Type","_Side","_Lot","_RiskPct","_SL","_TP","_Parts","_Basket","_WorstSL","_Inv"};
+   int n = ArraySize(keys);
+   for(int i = 0; i < n; i++) GlobalVariableDel("TM3_" + id + keys[i]);
 }
 
 //+------------------------------------------------------------------+
 //| GUI PANEL                                                          |
 //+------------------------------------------------------------------+
-// Height now accounts for: single-line partial summary (fixed 18px instead
-// of partialsCount*18), plus a dynamic position-list block sized to the
-// current number of managed open positions.
 int PanelHeight()
 {
-   // Increased base height (was 430) to give the Trade Selector row and
-   // Partial/BE/Close-Selected buttons more breathing room, and added a
-   // fixed bottom margin so the panel doesn't feel cramped against its own edge.
-   return 550 + PositionListHeight() + 20;
+   return 580 + PositionListHeight() + 20;
 }
 
 int PositionListHeight()
 {
    int count = CountManagedOpenPositions();
-   if(count <= 0) return 20; // "No open positions" line
+   if(count <= 0) return 20;
    return 20 + count * POS_ROW_H;
 }
 
@@ -1562,9 +1580,13 @@ void CreatePanelElements(int x, int y)
    Btn("Btn_Buy", x+5, y, 110, ROW_H, "BUY", false, COLOR_BUY);
    Btn("Btn_Sell", x+115, y, 110, ROW_H, "SELL", false, COLOR_SELL);
    y += ROW_H + PAD;
+   
    Lbl("Lbl_Lot", x+5, y+5, "Lot:");
-   Edit("Edit_Lot", x+115, y, 110, ROW_H, DoubleToString(ui.lotSize, 2));
+   Edit("Edit_Lot", x+45, y, 65, ROW_H, DoubleToString(ui.lotSize, 2));
+   Lbl("Lbl_RiskPct", x+115, y+5, "Risk%:");
+   Edit("Edit_RiskPct", x+160, y, 65, ROW_H, DoubleToString(ui.riskPercent, 2));
    y += ROW_H + PAD;
+   
    Lbl("Lbl_SL", x+5, y+5, "SL pts:");
    Edit("Edit_SL", x+65, y, 55, ROW_H, IntegerToString(ui.slPoints));
    Lbl("Lbl_SLP", x+125, y+5, "Prc:");
@@ -1581,7 +1603,6 @@ void CreatePanelElements(int x, int y)
    Rect("Sep3", x+5, y, PANEL_W-10, 1, C'80,80,80');
    y += 5;
 
-   // --- Compact single-line partial summary (was multi-row list) ---
    UpdatePartialLine(x, y);
    y += 18;
 
@@ -1601,7 +1622,6 @@ void CreatePanelElements(int x, int y)
    Rect("SepSel1", x+5, y, PANEL_W-10, 1, C'80,80,80');
    y += 6;
 
-   // --- TRADE SELECTOR: cycle through open managed trades, act on the selected one ---
    Lbl("Lbl_SelHdr", x+5, y+2, "Trade Selector:");
    y += 14;
    Btn("Btn_SelPrev", x+5, y, 35, ROW_H, "<", false, C'70,70,70');
@@ -1627,18 +1647,16 @@ void CreatePanelElements(int x, int y)
    Rect("Sep4", x+5, y, PANEL_W-10, 1, C'80,80,80');
    y += 6;
 
-   // --- Merged label+state toggle buttons (was Lbl + Btn on separate calls) ---
-   Btn("Btn_AutoRisk", x+5, y, 105, ROW_H, ui.autoRiskEnabled ? "Auto Risk: ON" : "Auto Risk: OFF", false, ui.autoRiskEnabled ? C'180,0,100' : C'120,0,0');
-   Btn("Btn_Basket", x+115, y, 110, ROW_H, ui.basketEnabled ? "Handler: ON" : "Handler: OFF", false, ui.basketEnabled ? C'0,140,0' : C'120,0,0');
+   Btn("Btn_Basket", x+5, y, 220, ROW_H, ui.basketEnabled ? "Handler: ON" : "Handler: OFF", false, ui.basketEnabled ? C'0,140,0' : C'120,0,0');
    y += ROW_H + PAD;
 
-   Lbl("Lbl_GreenPts", x+5, y+5, "Close pts:");
-   Edit("Edit_GreenPts", x+85, y, 140, ROW_H, IntegerToString(InpBasketGreenPoints));
+   Btn("Btn_WorstSL", x+5, y, 105, ROW_H, ui.worstAutoSL ? "Worst SL: BE" : "Worst SL: OFF", false, ui.worstAutoSL ? C'0,140,140' : C'80,80,80');
+   Lbl("Lbl_GreenPts", x+115, y+5, "Pts:");
+   Edit("Edit_GreenPts", x+148, y, 77, ROW_H, IntegerToString(InpBasketGreenPoints));
    y += ROW_H + PAD;
    Rect("Sep5", x+5, y, PANEL_W-10, 1, C'80,80,80');
    y += 6;
 
-   // --- Per-position ticket list (BE / Close per trade) ---
    g_PosListX = x;
    g_PosListY = y;
    DrawPositionList(x, y);
@@ -1659,19 +1677,18 @@ void UpdatePanelUI()
       ObjectSetString (0, g_prefix+"Btn_Basket", OBJPROP_TEXT, ui.basketEnabled ? "Handler: ON" : "Handler: OFF");
       ObjectSetInteger(0, g_prefix+"Btn_Basket", OBJPROP_BGCOLOR, ui.basketEnabled ? C'0,140,0' : C'120,0,0');
    }
+   if(ObjectFind(0, g_prefix+"Btn_WorstSL") >= 0)
+   {
+      ObjectSetString (0, g_prefix+"Btn_WorstSL", OBJPROP_TEXT, ui.worstAutoSL ? "Worst SL: BE" : "Worst SL: OFF");
+      ObjectSetInteger(0, g_prefix+"Btn_WorstSL", OBJPROP_BGCOLOR, ui.worstAutoSL ? C'0,140,140' : C'80,80,80');
+   }
    if(ObjectFind(0, g_prefix+"Btn_Inverse") >= 0)
    {
       ObjectSetString (0, g_prefix+"Btn_Inverse", OBJPROP_TEXT, ui.inverseEnabled ? "INV: ON" : "INV: OFF");
       ObjectSetInteger(0, g_prefix+"Btn_Inverse", OBJPROP_BGCOLOR, ui.inverseEnabled ? C'180,100,0' : C'80,80,80');
    }
-   if(ObjectFind(0, g_prefix+"Btn_AutoRisk") >= 0)
-   {
-      ObjectSetString (0, g_prefix+"Btn_AutoRisk", OBJPROP_TEXT, ui.autoRiskEnabled ? "Auto Risk: ON" : "Auto Risk: OFF");
-      ObjectSetInteger(0, g_prefix+"Btn_AutoRisk", OBJPROP_BGCOLOR, ui.autoRiskEnabled ? C'180,0,100' : C'120,0,0');
-   }
 }
 
-// Collapsed single-line partial TP summary: "TP1:150 | TP2:300 | TP3:450"
 void UpdatePartialLine(int x, int y)
 {
    string nm = "PTL_Line";
@@ -1716,12 +1733,10 @@ void UpdateSLTPPrices(double ep)
 
 void UpdateStats(double priceRef)
 {
-   double tv = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-   double ts = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-   if(tv == 0 || ts == 0 || _Point == 0) return;
+   UpdateSymbolCache();
+   if(g_PointMult <= 0) return;
 
-   double pmf = (_Point / ts) * tv;
-   double riskUSD = ui.lotSize * ui.slPoints * pmf;
+   double riskUSD = ui.lotSize * ui.slPoints * g_PointMult;
    double rewUSD = 0;
    double remLot = ui.lotSize;
    double volStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
@@ -1734,10 +1749,10 @@ void UpdateStats(double priceRef)
       double partLot = MathFloor(ui.lotSize * (pct * 0.01) / volStep) * volStep;
       if(partLot < minLot) partLot = 0;
       if(partLot > 0 && partLot <= remLot)
-      { rewUSD += partLot * stepPts * i * pmf; remLot -= partLot; }
+      { rewUSD += partLot * stepPts * i * g_PointMult; remLot -= partLot; }
    }
    remLot = NormalizeDouble(remLot, 2);
-   if(remLot > 0) rewUSD += remLot * ui.tpPoints * pmf;
+   if(remLot > 0) rewUSD += remLot * ui.tpPoints * g_PointMult;
 
    if(ObjectFind(0, g_prefix+"Val_Risk") >= 0) ObjectSetString(0, g_prefix+"Val_Risk", OBJPROP_TEXT, "$"+DoubleToString(riskUSD, 2));
    if(ObjectFind(0, g_prefix+"Val_Rew") >= 0) ObjectSetString(0, g_prefix+"Val_Rew", OBJPROP_TEXT, "$"+DoubleToString(rewUSD, 2));
@@ -1797,15 +1812,6 @@ void DrawSideVis(double ep, ENUM_SIDE_UI side)
    for(int i = ui.partialsCount + 1; i <= 20; i++) ObjectDelete(0, g_prefix+pfx+"P"+IntegerToString(i));
 }
 
-//+------------------------------------------------------------------+
-//| PER-POSITION LIST: shows every managed open trade (own+external)  |
-//| with its own BE / Close buttons so multi-trade actions are        |
-//| unambiguous.                                                      |
-//+------------------------------------------------------------------+
-// Read-only info list -- per-row action buttons were removed in favor of the
-// Trade Selector (Prev/Next + Partial/BE/Close-Selected), which scales cleanly
-// to any number of trades without needing N buttons per row. The currently
-// selected ticket is highlighted with a colored marker.
 void DrawPositionList(int x, int y)
 {
    Lbl("Lbl_PosList", x+5, y, "Open Positions:");
@@ -1857,7 +1863,6 @@ void DrawPositionList(int x, int y)
       ObjectDelete(0, g_prefix+"PosRow_None");
    }
 
-   // Remove row labels for tickets that no longer have an open position
    int objTotal = ObjectsTotal(0, -1, -1);
    for(int j = objTotal - 1; j >= 0; j--)
    {
@@ -1872,10 +1877,6 @@ void DrawPositionList(int x, int y)
    }
 }
 
-
-// Lightweight refresh used every ~500ms from OnTick. Reuses the stored
-// panel coordinates and only touches position-list objects -- never
-// touches Edit_Price/Edit_SL_Prc/Edit_TP_Prc, so no flicker.
 void RefreshPositionList()
 {
    if(g_PosListX == 0 && g_PosListY == 0) return;
@@ -1885,9 +1886,6 @@ void RefreshPositionList()
    DrawPositionList(g_PosListX, g_PosListY);
 }
 
-//+------------------------------------------------------------------+
-//| GUI PRIMITIVE HELPERS                                              |
-//+------------------------------------------------------------------+
 void Btn(string n, int x, int y, int w, int h, string t, bool act, color b = COLOR_BTN)
 {
    string nm = g_prefix + n;
@@ -1918,7 +1916,7 @@ void Rect(string n, int x, int y, int w, int h, color bg)
       ObjectSetInteger(0, nm, OBJPROP_SELECTABLE, false);
       ObjectSetInteger(0, nm, OBJPROP_CORNER, InpPanelCorner);
    }
-   ObjectSetInteger(0, nm, OBJPROP_ZORDER, 999); // keep panel background just below controls, above indicators
+   ObjectSetInteger(0, nm, OBJPROP_ZORDER, 999);
    ObjectSetInteger(0, nm, OBJPROP_XDISTANCE, x);
    ObjectSetInteger(0, nm, OBJPROP_YDISTANCE, y);
    ObjectSetInteger(0, nm, OBJPROP_XSIZE, w);
@@ -1949,14 +1947,6 @@ void Edit(string n, int x, int y, int w, int h, string t)
       return;
    }
 
-   // CRITICAL FIX: MT5's native OBJ_EDIT control visibly flashes/redraws whenever
-   // its geometry properties (XDISTANCE/YDISTANCE/XSIZE/YSIZE) are re-applied via
-   // ObjectSetInteger -- even when set to the SAME values it already has. Since
-   // RebuildPanel() can run repeatedly (CHART_CHANGE events, panel-height changes
-   // as trade count fluctuates, etc.), re-touching every Edit box's bounds on each
-   // call was the real source of the flicker. Now we only touch geometry if it
-   // actually changed since the last call, and NEVER touch OBJPROP_TEXT here at
-   // all -- text is fully owned by the live price-update code in OnTick.
    if((int)ObjectGetInteger(0, nm, OBJPROP_XDISTANCE) != x)
       ObjectSetInteger(0, nm, OBJPROP_XDISTANCE, x);
    if((int)ObjectGetInteger(0, nm, OBJPROP_YDISTANCE) != y)
@@ -1996,11 +1986,7 @@ void Line(string sfx, double price, color col, ENUM_LINE_STYLE st, int wd, strin
    ObjectSetInteger(0, nm, OBJPROP_SELECTABLE,false);
    if(lbl != "") ObjectSetString(0, nm, OBJPROP_TEXT, lbl);
 }
-//+------------------------------------------------------------------+
 
-//+------------------------------------------------------------------+
-//| Escape string for JSON                                           |
-//+------------------------------------------------------------------+
 string EscapeJsonString(string _input)
 {
    string output = _input;
@@ -2011,9 +1997,6 @@ string EscapeJsonString(string _input)
    return output;
 }
 
-//+------------------------------------------------------------------+
-//| Build JSON Payload                                               |
-//+------------------------------------------------------------------+
 string BuildJSON(string event_name, ulong ticket, string symbol, string side, 
                  double volume, double price, double sl, double tp, 
                  double profit, string note, string source, string screenshot_file)
@@ -2042,12 +2025,8 @@ string BuildJSON(string event_name, ulong ticket, string symbol, string side,
    return json;
 }
 
-//+------------------------------------------------------------------+
-//| Take Clean Screenshot (100% Resolution, 30% File Size)           |
-//+------------------------------------------------------------------+
 string TakeCleanScreenshot(ulong ticket, string event_name)
 {
-   // 1. Move UI out of bounds
    int total = ObjectsTotal(0, -1, -1);
    for(int i = 0; i < total; i++)
    {
@@ -2062,7 +2041,6 @@ string TakeCleanScreenshot(ulong ticket, string event_name)
    ChartRedraw(0);
    Sleep(50); 
    
-   // 2. Generate Filenames
    string baseFilename = "Journal\\" + (string)ticket + "_" + event_name + "_" + TimeToString(TimeCurrent(), TIME_DATE|TIME_MINUTES);
    StringReplace(baseFilename, ":", "");
    StringReplace(baseFilename, ".", "");
@@ -2071,12 +2049,10 @@ string TakeCleanScreenshot(ulong ticket, string event_name)
    string bmpFile = baseFilename + "_raw.bmp";
    string jpgFile = baseFilename + ".jpg";
    
-   // 3. Capture at 100% full chart resolution as raw BMP
    int chart_w = (int)ChartGetInteger(0, CHART_WIDTH_IN_PIXELS);
    int chart_h = (int)ChartGetInteger(0, CHART_HEIGHT_IN_PIXELS);
    ChartScreenShot(0, bmpFile, chart_w, chart_h, ALIGN_RIGHT);
    
-   // 4. Restore UI
    for(int i = 0; i < total; i++)
    {
       string name = ObjectName(0, i);
@@ -2088,19 +2064,15 @@ string TakeCleanScreenshot(ulong ticket, string event_name)
    }
    ChartRedraw(0);
    
-   // 5. Compress to 30% Quality JPEG
-   if(CompressJPEG(bmpFile, jpgFile, InpImageQuality)) // The '30' here is your quality target
+   if(CompressJPEG(bmpFile, jpgFile, InpImageQuality))
    {
-      FileDelete(bmpFile); // Remove the heavy raw file
+      FileDelete(bmpFile);
       return jpgFile;
    }
    
-   // Fallback in case of Windows API failure
    return bmpFile;
 }
-//+------------------------------------------------------------------+
-//| Add Event to Delay Queue (Non-Blocking)                          |
-//+------------------------------------------------------------------+
+
 void JournalEvent(string event_name, ulong ticket, string symbol, string side, 
                   double volume, double price, double sl, double tp, 
                   double profit, string note, string source)
@@ -2110,10 +2082,7 @@ void JournalEvent(string event_name, ulong ticket, string symbol, string side,
    int n = ArraySize(g_JournalQueue);
    ArrayResize(g_JournalQueue, n + 1);
    
-   // Set the delay (TimeCurrent() + 2 means it will wait 2 seconds)
    g_JournalQueue[n].trigger_time = TimeCurrent() + 2; 
-   
-   // Store the data
    g_JournalQueue[n].event_name = event_name;
    g_JournalQueue[n].ticket = ticket;
    g_JournalQueue[n].symbol = symbol;
@@ -2126,9 +2095,7 @@ void JournalEvent(string event_name, ulong ticket, string symbol, string side,
    g_JournalQueue[n].note = note;
    g_JournalQueue[n].source = source;
 }
-//+------------------------------------------------------------------+
-//| Execute Journal Event Orchestrator                               |
-//+------------------------------------------------------------------+
+
 void ProcessJournalEvent(string event_name, ulong ticket, string symbol, string side, 
                   double volume, double price, double sl, double tp, 
                   double profit, string note, string source)
@@ -2137,13 +2104,11 @@ void ProcessJournalEvent(string event_name, ulong ticket, string symbol, string 
 
    string screenshot_file = "";
    
-   // 1. Take Screenshot ONLY on OPEN
    if(event_name == "OPEN")
    {
       screenshot_file = TakeCleanScreenshot(ticket, event_name);
    }
    
-   // 2. Write to CSV
    string csv_filename = "TM3_Journal.csv";
    int handle = FileOpen(csv_filename, FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_COMMON, ",");
    if(handle != INVALID_HANDLE)
@@ -2157,12 +2122,9 @@ void ProcessJournalEvent(string event_name, ulong ticket, string symbol, string 
       FileClose(handle);
    }
 
-   // 3. Send Webhook
    SendJournalWebhook(event_name, ticket, symbol, side, volume, price, sl, tp, profit, note, source, screenshot_file);
 }
-//+------------------------------------------------------------------+
-//| Execute Journal Event via Webhook (Multipart & JSON Hybrid)      |
-//+------------------------------------------------------------------+
+
 bool SendJournalWebhook(const string event_name, const ulong ticket, const string symbol, 
                         const string side, const double volume, const double price, 
                         const double sl, const double tp, const double profit, 
@@ -2173,13 +2135,11 @@ bool SendJournalWebhook(const string event_name, const ulong ticket, const strin
    uchar file_data[];
    bool has_file = false;
    
-   // Only attempt to read the file if a filename was provided
    if(StringLen(screenshot_file) > 0)
    {
       has_file = ReadScreenshotFileToArray(screenshot_file, file_data);
    }
 
-   // --- MULTIPART/FORM-DATA (For events with screenshots, e.g., OPEN) ---
    if(has_file)
    {
       string boundary = BuildMultipartBoundary();
@@ -2205,7 +2165,6 @@ bool SendJournalWebhook(const string event_name, const ulong ticket, const strin
       fields[15][0] = "account_server";fields[15][1] = AccountInfoString(ACCOUNT_SERVER);
       fields[16][0] = "chart_symbol";  fields[16][1] = _Symbol;
 
-      // Append Text Fields
       for(int i = 0; i < 17; i++)
       {
          CharArrayAppendString(body, "--" + boundary + "\r\n");
@@ -2213,7 +2172,6 @@ bool SendJournalWebhook(const string event_name, const ulong ticket, const strin
          CharArrayAppendString(body, fields[i][1] + "\r\n");
       }
 
-      // Append File Field (Set to image/jpeg for the GDI+ compressed image)
       CharArrayAppendString(body, "--" + boundary + "\r\n");
       CharArrayAppendString(body, "Content-Disposition: form-data; name=\"screenshot\"; filename=\"" + screenshot_file + "\"\r\n");
       CharArrayAppendString(body, "Content-Type: image/jpeg\r\n\r\n");
@@ -2226,7 +2184,6 @@ bool SendJournalWebhook(const string event_name, const ulong ticket, const strin
       string headers = "Content-Type: multipart/form-data; boundary=" + boundary + "\r\n";
 
       ResetLastError();
-      // 10000ms timeout to ensure large files have time to upload
       int http_code = WebRequest("POST", InpWebhookURL, headers, 10000, body, response_body, response_headers);
       
       if(http_code < 200 || http_code >= 300)
@@ -2234,8 +2191,6 @@ bool SendJournalWebhook(const string event_name, const ulong ticket, const strin
       
       return (http_code >= 200 && http_code < 300);
    }
-   
-   // --- APPLICATION/JSON (For events without screenshots, e.g., SL/TP Hits) ---
    else 
    {
       string payload = BuildJSON(event_name, ticket, symbol, side, volume, price, sl, tp, profit, note, source, "");
@@ -2245,7 +2200,6 @@ bool SendJournalWebhook(const string event_name, const ulong ticket, const strin
       string response_headers;
 
       StringToCharArray(payload, request_body, 0, WHOLE_ARRAY, CP_UTF8);
-      // Strip the trailing null character added by StringToCharArray to prevent JSON parsing errors
       if(ArraySize(request_body) > 0) 
          ArrayResize(request_body, ArraySize(request_body) - 1); 
 
@@ -2260,9 +2214,7 @@ bool SendJournalWebhook(const string event_name, const ulong ticket, const strin
       return (http_code >= 200 && http_code < 300);
    }
 }
-//+------------------------------------------------------------------+
-//| Webhook Helpers                                                  |
-//+------------------------------------------------------------------+
+
 string BuildMultipartBoundary()
 {
    return("----TM3Boundary" + IntegerToString((int)TimeLocal()) + IntegerToString(GetTickCount()));
@@ -2273,7 +2225,6 @@ bool ReadScreenshotFileToArray(const string file_name, uchar &data[])
    ArrayResize(data, 0);
    if(StringLen(file_name) <= 0) return false;
 
-   // ChartScreenShot saves into terminal MQL5\Files 
    int handle = FileOpen(file_name, FILE_READ|FILE_BIN|FILE_SHARE_READ);
    if(handle == INVALID_HANDLE)
    {
@@ -2310,7 +2261,7 @@ void CharArrayAppendString(char &body[], const string text)
    int add = ArraySize(tmp);
    if(add <= 0) return;
    
-   add--; // Drop trailing '\0'
+   add--; 
    if(add <= 0) return;
 
    int old = ArraySize(body);
@@ -2328,26 +2279,19 @@ void CharArrayAppendBytes(char &body[], const uchar &data[])
    for(int i = 0; i < add; i++) body[old + i] = (char)data[i];
 }
 
-//+------------------------------------------------------------------+
-//| Native GDI+ Image Compressor (100% Res, 30% Quality)             |
-//+------------------------------------------------------------------+
 bool CompressJPEG(string inputFile, string outputFile, uint qualityLevel)
 {
-   // 1. Resolve absolute paths (GDI+ requires full Windows paths, not MT5 relative paths)
    string dataPath = TerminalInfoString(TERMINAL_DATA_PATH) + "\\MQL5\\Files\\";
    string absInput = dataPath + inputFile;
    string absOutput = dataPath + outputFile;
 
-   // 2. Initialize GDI+
    uchar startupInput[24] = {1,0,0,0, 0,0,0,0, 0,0,0,0,0,0,0,0, 0,0,0,0, 0,0,0,0};
    ulong gdiToken = 0;
    if(GdiplusStartup(gdiToken, startupInput, 0) != 0) return false;
 
-   // 3. Get Windows CLSID for JPEG Encoder
    uchar jpegClsid[16];
    CLSIDFromString("{557CF401-1A04-11D3-9A73-0000F81EF32E}", jpegClsid);
 
-   // 4. Load the raw uncompressed image
    ulong imagePtr = 0;
    if(GdipLoadImageFromFile(absInput, imagePtr) != 0)
    {
@@ -2355,35 +2299,31 @@ bool CompressJPEG(string inputFile, string outputFile, uint qualityLevel)
       return false;
    }
 
-   // 5. Build C++ EncoderParameters memory struct for Image Quality
-   ulong valPtr = GlobalAlloc(0x0040, 4); // Allocate memory for the integer
+   ulong valPtr = GlobalAlloc(0x0040, 4);
    uint qualArr[1];
    qualArr[0] = qualityLevel;
-   RtlMoveMemory(valPtr, qualArr, 4);     // Move our quality level into memory
+   RtlMoveMemory(valPtr, qualArr, 4);
 
    uchar encParams[40];
    ArrayInitialize(encParams, 0);
-   encParams[0] = 1; // Count = 1
+   encParams[0] = 1;
    
-   // GUID for Quality Parameter: {1D5BE4B5-FA4A-452D-9CDD-5DB35105E7EB}
    uchar guid[16] = {0xB5,0xE4,0x5B,0x1D, 0x4A,0xFA, 0x2D,0x45, 0x9C,0xDD, 0x5D,0xB3,0x51,0x05,0xE7,0xEB};
    ArrayCopy(encParams, guid, 8, 0, 16);
    
-   encParams[24] = 1; // NumberOfValues = 1
-   encParams[28] = 4; // Type = 4 (EncoderParameterValueTypeLong)
+   encParams[24] = 1;
+   encParams[28] = 4;
    
-   // Insert our memory pointer into the struct
    ULongToBytes ptrConv;
    ptrConv.value = valPtr;
    ArrayCopy(encParams, ptrConv.bytes, 32, 0, 8);
 
-   // 6. Save the compressed JPEG
    int res = GdipSaveImageToFile(imagePtr, absOutput, jpegClsid, encParams);
 
-   // 7. Clean up memory to prevent leaks
    GlobalFree(valPtr);
    GdipDisposeImage(imagePtr);
    GdiplusShutdown(gdiToken);
 
    return (res == 0);
 }
+//+------------------------------------------------------------------+
