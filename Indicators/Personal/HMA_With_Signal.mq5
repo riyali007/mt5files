@@ -1,8 +1,8 @@
 //+------------------------------------------------------------------+
-//|                                       HMA_with_Engulfing.mq5      |
+//|                                       HMA_with_Engulfing.mq5     |
 //|  Base: HMA.mq5 - HMA math is 100% UNCHANGED, byte-for-byte         |
-//|  identical to the original working file.                          |
-//|                                                                     |
+//|  identical to the original working file.                           |
+//|                                                                  |
 //|  Added: Setup 1 ONLY - Engulfing Break Signal.                     |
 //|    1. Price closes above HMA -> check Bullish Engulfing -> Buy     |
 //|    2. Price closes below HMA -> check Bearish Engulfing -> Sell    |
@@ -10,12 +10,12 @@
 //|       extended forward by a configurable number of candles.        |
 //|  Signal logic only evaluates fully CLOSED bars - never repaints,   |
 //|  never touches the live/forming bar.                                |
-//|                                                                     |
+//|                                                                  |
 //|  Object cleanup: tied ONLY to OnInit(), which fires exactly once   |
 //|  per genuine attach / reattach / timeframe switch / symbol switch  |
 //|  / input change - never on ordinary tick processing. This removes  |
 //|  stale signal lines from a previous timeframe without ever wiping  |
-//|  objects on a normal recalculation tick.                            |
+//|  objects on a normal recalculation tick.                           |
 //+------------------------------------------------------------------+
 #property indicator_chart_window
 #property indicator_buffers 1
@@ -78,7 +78,7 @@ int OnInit()
 //+------------------------------------------------------------------+
 //| OnDeinit - clear objects on teardown-style reasons too, as a      |
 //| defensive backstop (OnInit's cleanup already covers the normal    |
-//| re-attach/timeframe-switch case).                                   |
+//| re-attach/timeframe-switch case).                                  |
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
   {
@@ -164,7 +164,7 @@ void DrawSignalRange(int i, const datetime &time[], const double &high[], const 
 //| exactly as the original HMA.mq5 writes it.                         |
 //+------------------------------------------------------------------+
 void RunEngulfingSignals(int rates_total, const datetime &time[], const double &open[],
-                          const double &high[], const double &low[], const double &close[])
+                         const double &high[], const double &low[], const double &close[])
   {
    if(!EnableEngulfing) return;
    if(rates_total < 3) return;
@@ -203,10 +203,7 @@ void RunEngulfingSignals(int rates_total, const datetime &time[], const double &
   }
 
 //+------------------------------------------------------------------+
-//| OnCalculate - HMA math is 100% UNCHANGED from the original         |
-//| HMA.mq5, including its original "return 0" failure paths (left     |
-//| exactly as-is, since the base file never blinked with these).       |
-//| Only addition: one call to RunEngulfingSignals at the very end.    |
+//| OnCalculate - Fixed CopyBuffer fallback to prevent flickering.    |
 //+------------------------------------------------------------------+
 int OnCalculate(const int rates_total, const int prev_calculated, const datetime &time[],
                  const double &open[], const double &high[], const double &low[], const double &close[],
@@ -219,9 +216,14 @@ int OnCalculate(const int rates_total, const int prev_calculated, const datetime
    else limit = rates_total - InpPeriod;
 
    int sqrt_period = (int)MathFloor(MathSqrt(InpPeriod));
+   int to_copy = limit + sqrt_period;
 
-   if(CopyBuffer(handle_WMA_half, 0, 0, limit + sqrt_period, arr_half) <= 0) return 0;
-   if(CopyBuffer(handle_WMA_full, 0, 0, limit + sqrt_period, arr_full) <= 0) return 0;
+   // FIX: If buffers aren't ready, return prev_calculated instead of 0 to stop chart wiping/flickering
+   if(CopyBuffer(handle_WMA_half, 0, 0, to_copy, arr_half) < to_copy || 
+      CopyBuffer(handle_WMA_full, 0, 0, to_copy, arr_full) < to_copy)
+     {
+      return (prev_calculated > 0 ? prev_calculated : 0);
+     }
 
    double raw_hma[];
    ArrayResize(raw_hma, limit + sqrt_period);
