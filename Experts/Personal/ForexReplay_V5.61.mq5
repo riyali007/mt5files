@@ -1,10 +1,13 @@
 //+------------------------------------------------------------------+
 //|                                                  ForexReplay.mq5 |
-//|                             Professional Forex Replay Simulator  |
-//|    Clean UI, BE Config, Worst SL, No Closed History & Fix TF P#  |
+//|                        Professional Forex Replay Simulator       |
+//| Clean UI, BE Config, Worst SL, No Closed History & Fix TF P#     |
+//| v5.70 - Added DrawDown (DD) Limit Entries + auto-cancel on first |
+//|         partial. Everything else is unchanged from the working  |
+//|         v5.60 baseline.                                          |
 //+------------------------------------------------------------------+
 #property copyright "ForexReplay"
-#property version   "5.60"
+#property version   "5.70"
 #property strict
 
 //--- Simulation Start Mode
@@ -15,70 +18,78 @@ enum ENUM_START_MODE
 };
 
 input group "=== Simulation Start Mode ==="
-input ENUM_START_MODE InpStartMode     = START_MODE_EXACT_DATETIME; // Starting Mode
-input datetime        InpExactStartTime= D'2026.06.16 07:00:00';    // Replay Start Time (e.g. 07:00)
-input bool            InpUseSwedishTime= true;                      // Input is Swedish Time (converts to Broker time)
-input int             InpWarmupDays    = 20;                        // History buffer before start date (warmup)
+input ENUM_START_MODE InpStartMode      = START_MODE_EXACT_DATETIME; // Starting Mode
+input datetime         InpExactStartTime= D'2026.06.16 07:00:00';     // Replay Start Time (e.g. 07:00)
+input bool             InpUseSwedishTime= true;                       // Input is Swedish Time (converts to Broker time)
+input int              InpWarmupDays    = 20;                         // History buffer before start date (warmup)
 
 input group "=== Relative Mode Inputs (if Mode = Days Ago) ==="
-input int             InpDaysBack      = 80;
-input int             InpStartAgo      = 60;
+input int InpDaysBack  = 80;
+input int InpStartAgo  = 60;
 
 input group "=== Execution & Trading Defaults ==="
-input int             InpTimerMs       = 100;
-input double          InpBalance0      = 10000.0;
-input double          InpLots0         = 0.45;
-input double          InpRiskPct0      = 2.0;
-input int             InpSL0           = 600;
-input int             InpTP0           = 1200;
-input int             InpSpeed0        = 1;
-input int             InpPartials0     = 4;
-input int             InpBEAfter0      = 1;     // Default Partial step to move SL to BE (e.g. 1 = after Partial 1)
+input int    InpTimerMs     = 100;
+input double InpBalance0    = 10000.0;
+input double InpLots0       = 0.45;
+input double InpRiskPct0    = 2.0;
+input int    InpSL0         = 600;
+input int    InpTP0         = 1200;
+input int    InpSpeed0      = 1;
+input int    InpPartials0   = 4;
+input int    InpBEAfter0    = 1;  // Default Partial step to move SL to BE (e.g. 1 = after Partial 1)
+
+input group "=== DrawDown Entries ==="
+input bool InpEnableDDEntries         = true;  // Enable auto DrawDown Limit Orders
+input int  InpDD_OrderCount           = 2;     // Number of additional Limit Orders
+input int  InpDD_Spacing              = 200;   // Spacing between DD entries (points)
+input bool InpDD_SameSL               = true;  // Use same SL price for all DD entries
+input bool InpDD_CancelOnFirstPartial = true;  // Cancel remaining DD limit orders on first partial hit
 
 input group "=== Compact Journaling Screenshots ==="
-input bool            InpJournal       = true;  // Enable CSV logging & Entry Screenshots
-input int             InpShotW         = 960;   // Compact Capture Width (px)
-input int             InpShotH         = 540;   // Compact Capture Height (px)
+input bool InpJournal = true;   // Enable CSV logging & Entry Screenshots
+input int  InpShotW   = 960;    // Compact Capture Width (px)
+input int  InpShotH   = 540;    // Compact Capture Height (px)
 
-#define TPL_NAME        "ForexReplayAuto"
-#define SIM_GROUP       "Simulators"
-#define SIM_PREF        "SIM."
-#define UI              "FR_"
-#define JOURNAL_DIR     "ForexReplayJournal"
-#define JOURNAL_CSV     "ForexReplayJournal\\journal.csv"
-#define STATE_CSV       "ForexReplayJournal\\positions_state.csv"
+#define TPL_NAME     "ForexReplayAuto"
+#define SIM_GROUP    "Simulators"
+#define SIM_PREF     "SIM."
+#define UI           "FR_"
+#define JOURNAL_DIR  "ForexReplayJournal"
+#define JOURNAL_CSV  "ForexReplayJournal\\journal.csv"
+#define STATE_CSV    "ForexReplayJournal\\positions_state.csv"
 
 // Panel Layout Coordinates
-#define PANEL_X         12
-#define PANEL_Y         30
-#define PANEL_W         270
-#define ROW_H           24
-#define GAP             4
+#define PANEL_X 12
+#define PANEL_Y 30
+#define PANEL_W 270
+#define ROW_H   24
+#define GAP     4
 
 // Color Palette
-#define CLR_PANEL_BG    C'28,28,30'
-#define CLR_INPUT_BG    C'38,38,42'
-#define CLR_BORDER      C'55,55,62'
-#define CLR_BLUE_ACTIVE C'0,122,255'
-#define CLR_TAB_INACT   C'48,48,54'
-#define CLR_BUY_GREEN   C'34,197,94'
-#define CLR_SELL_RED    C'239,68,68'
-#define CLR_PARTIAL_YEL C'161,128,0'
-#define CLR_BE_TEAL     C'13,110,110'
-#define CLR_CLOSE_SEL   C'180,75,20'
-#define CLR_CLOSE_ALL   C'255,0,0'
-#define CLR_BTN_GRAY    C'70,70,78'
-#define CLR_TEXT_MUTED  C'160,160,170'
-#define CLR_TEXT_GREEN  C'34,197,94'
-#define CLR_TEXT_RED    C'239,68,68'
+#define CLR_PANEL_BG      C'28,28,30'
+#define CLR_INPUT_BG      C'38,38,42'
+#define CLR_BORDER        C'55,55,62'
+#define CLR_BLUE_ACTIVE   C'0,122,255'
+#define CLR_TAB_INACT     C'48,48,54'
+#define CLR_BUY_GREEN     C'34,197,94'
+#define CLR_SELL_RED      C'239,68,68'
+#define CLR_PARTIAL_YEL   C'161,128,0'
+#define CLR_BE_TEAL       C'13,110,110'
+#define CLR_CLOSE_SEL     C'180,75,20'
+#define CLR_CLOSE_ALL     C'255,0,0'
+#define CLR_BTN_GRAY      C'70,70,78'
+#define CLR_TEXT_MUTED    C'160,160,170'
+#define CLR_TEXT_GREEN    C'34,197,94'
+#define CLR_TEXT_RED      C'239,68,68'
 
-#define MAX_PARTIALS    10
+#define MAX_PARTIALS 10
 
 enum ENUM_SIDE { SIDE_BUY = 1, SIDE_SELL = -1 };
 
 struct SimPos
 {
    ulong       ticket;
+   ulong       group_id;      // Links a main entry with its DD (drawdown) sibling limit orders
    ENUM_SIDE   side;
    double      lots;
    double      orig_lots;
@@ -91,6 +102,8 @@ struct SimPos
    double      close_price;
    double      pnl;
    bool        open;
+   bool        is_pending;    // true while this is an untriggered DD limit order
+   bool        is_dd_entry;   // true for the auto DrawDown limit orders (not the primary entry)
    int         partials;
    int         be_after;
    int         next_partial;
@@ -101,22 +114,23 @@ struct SimPos
 };
 
 // Global Replay State
-bool        g_is_sim      = false;
-bool        g_playing     = false;
-datetime    g_from = 0, g_to = 0, g_cursor = 0;
-int         g_sub_sec     = 0;
-double      g_balance = 0, g_equity = 0, g_peak = 0, g_maxdd = 0, g_closed_pnl = 0;
-string      g_source = "", g_sim = "";
-MqlRates    g_m1[];
-int         g_m1_n        = 0;
-SimPos      g_pos[];
-ulong       g_next        = 1;
-int         g_speed       = 1;
-int         g_wins        = 0, g_losses = 0;
+bool     g_is_sim   = false;
+bool     g_playing  = false;
+datetime g_from = 0, g_to = 0, g_cursor = 0;
+int      g_sub_sec  = 0;
+double   g_balance = 0, g_equity = 0, g_peak = 0, g_maxdd = 0, g_closed_pnl = 0;
+string   g_source = "", g_sim = "";
+MqlRates g_m1[];
+int      g_m1_n = 0;
+SimPos   g_pos[];
+ulong    g_next = 1;
+ulong    g_next_group = 1;
+int      g_speed = 1;
+int      g_wins = 0, g_losses = 0;
 
 // Panel-Specific State Variables
-int         g_selected_idx    = -1;
-bool        g_worst_sl_active = false;
+int  g_selected_idx    = -1;
+bool g_worst_sl_active = false;
 
 // Forward declarations
 int      InitLauncher();
@@ -138,6 +152,8 @@ double   InterpolatePrice(const MqlRates &bar, const int sec);
 int      FindBar(const datetime t);
 double   SpreadPx();
 void     OpenVirt(const ENUM_SIDE side);
+void     CreateSimPos(ENUM_SIDE side, double lots, double entry, double sl, double tp, int partials, int be_after_cfg, bool is_pending, ulong group_id, bool is_dd_entry);
+void     CancelRemainingDDOrders(const ulong group_id);
 void     CheckPartialsAndStops(const double highPrice, const double lowPrice);
 void     CheckWorstSL(const double live_bid, const double live_ask);
 void     MoveSlToBreakeven(const int i);
@@ -185,7 +201,7 @@ int OnInit()
 }
 
 //+------------------------------------------------------------------+
-//| Expert deinitialization function                                 |
+//| Expert deinitialization function                                  |
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
@@ -307,13 +323,13 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
          else
          {
             int total = ArraySize(g_pos);
-            int step = (sparam == UI + "SEL_NEXT") ? 1 : -1;
+            int step  = (sparam == UI + "SEL_NEXT") ? 1 : -1;
             int start = (g_selected_idx < 0) ? 0 : g_selected_idx + step;
 
             for(int k = 0; k < total; k++)
             {
                int check = (start + k * step + total * 10) % total;
-               if(g_pos[check].open)
+               if(g_pos[check].open && !g_pos[check].is_pending)
                {
                   g_selected_idx = check;
                   break;
@@ -336,7 +352,7 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
       }
       if(sparam == UI + "BTN_BE_SEL")
       {
-         if(g_selected_idx >= 0 && g_selected_idx < ArraySize(g_pos) && g_pos[g_selected_idx].open)
+         if(g_selected_idx >= 0 && g_selected_idx < ArraySize(g_pos) && g_pos[g_selected_idx].open && !g_pos[g_selected_idx].is_pending)
          {
             MoveSlToBreakeven(g_selected_idx);
             UpdateModernPanelData();
@@ -346,7 +362,7 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
       }
       if(sparam == UI + "BTN_CLOSE_SEL")
       {
-         if(g_selected_idx >= 0 && g_selected_idx < ArraySize(g_pos) && g_pos[g_selected_idx].open)
+         if(g_selected_idx >= 0 && g_selected_idx < ArraySize(g_pos) && g_pos[g_selected_idx].open && !g_pos[g_selected_idx].is_pending)
          {
             int cur_idx = FindBar(g_cursor);
             double px = (g_pos[g_selected_idx].side == SIDE_BUY ? g_m1[cur_idx].close : g_m1[cur_idx].close + SpreadPx());
@@ -402,7 +418,7 @@ datetime ResolveBrokerTime(const datetime userLocalTime)
 }
 
 //+------------------------------------------------------------------+
-//| Launcher Initialization                                          |
+//| Launcher Initialization                                           |
 //+------------------------------------------------------------------+
 int InitLauncher()
 {
@@ -430,7 +446,7 @@ void LayoutLauncher()
 }
 
 //+------------------------------------------------------------------+
-//| Start Simulation Trigger                                         |
+//| Start Simulation Trigger                                          |
 //+------------------------------------------------------------------+
 void StartSimFromLauncher()
 {
@@ -445,7 +461,7 @@ void StartSimFromLauncher()
          return;
       }
       g_cursor = targetBrokerTime;
-      g_from = g_cursor - (datetime)MathMax(1, InpWarmupDays) * 86400;
+      g_from   = g_cursor - (datetime)MathMax(1, InpWarmupDays) * 86400;
    }
    else
    {
@@ -484,7 +500,7 @@ void StartSimFromLauncher()
 }
 
 //+------------------------------------------------------------------+
-//| Custom Symbol Setup                                              |
+//| Custom Symbol Setup                                               |
 //+------------------------------------------------------------------+
 bool EnsureSymbol(const string sim, const string origin)
 {
@@ -516,7 +532,7 @@ bool EnsureSymbol(const string sim, const string origin)
 }
 
 //+------------------------------------------------------------------+
-//| Seed Initial History                                             |
+//| Seed Initial History                                              |
 //+------------------------------------------------------------------+
 bool SeedToCursor(const string sim, const string origin, const datetime from, const datetime until)
 {
@@ -559,19 +575,19 @@ bool SeedToCursor(const string sim, const string origin, const datetime from, co
 }
 
 //+------------------------------------------------------------------+
-//| Replay Mode Initialization                                       |
+//| Replay Mode Initialization                                        |
 //+------------------------------------------------------------------+
 int InitReplay()
 {
    if(!LoadFullSessionState())
    {
-      g_sim      = _Symbol;
-      g_source   = StringSubstr(_Symbol, StringLen(SIM_PREF));
-      g_to       = TimeCurrent();
-      g_from     = g_to - (datetime)InpDaysBack * 86400;
-      g_cursor   = g_to - (datetime)InpStartAgo * 86400;
-      g_balance  = InpBalance0;
-      g_speed    = InpSpeed0;
+      g_sim     = _Symbol;
+      g_source  = StringSubstr(_Symbol, StringLen(SIM_PREF));
+      g_to      = TimeCurrent();
+      g_from    = g_to - (datetime)InpDaysBack * 86400;
+      g_cursor  = g_to - (datetime)InpStartAgo * 86400;
+      g_balance = InpBalance0;
+      g_speed   = InpSpeed0;
    }
 
    if(!LoadReplayM1())
@@ -594,7 +610,7 @@ int InitReplay()
 }
 
 //+------------------------------------------------------------------+
-//| Load M1 dataset for continuous playback                          |
+//| Load M1 dataset for continuous playback                           |
 //+------------------------------------------------------------------+
 bool LoadReplayM1()
 {
@@ -604,7 +620,7 @@ bool LoadReplayM1()
 }
 
 //+------------------------------------------------------------------+
-//| Build Left Middle-Docked Trading & Replay Panel                  |
+//| Build Left Middle-Docked Trading & Replay Panel                   |
 //+------------------------------------------------------------------+
 void BuildModernControlPanel()
 {
@@ -749,7 +765,7 @@ void UpdateModernPanelData()
 
    // Update Trade Selector Label
    int openCount = CountOpen();
-   if(openCount == 0 || g_selected_idx < 0 || g_selected_idx >= ArraySize(g_pos) || !g_pos[g_selected_idx].open)
+   if(openCount == 0 || g_selected_idx < 0 || g_selected_idx >= ArraySize(g_pos) || !g_pos[g_selected_idx].open || g_pos[g_selected_idx].is_pending)
    {
       g_selected_idx = -1;
       ObjectSetString(0, UI + "ED_SEL_DISPLAY", OBJPROP_TEXT, "Selected: none");
@@ -822,7 +838,7 @@ void RecalculateRiskFromLot(bool fromLot)
 }
 
 //+------------------------------------------------------------------+
-//| Adaptive Step                                                    |
+//| Adaptive Step                                                     |
 //+------------------------------------------------------------------+
 bool AdvanceStep()
 {
@@ -834,7 +850,7 @@ bool AdvanceStep()
 }
 
 //+------------------------------------------------------------------+
-//| Advance Replay by 1 Second                                       |
+//| Advance Replay by 1 Second                                        |
 //+------------------------------------------------------------------+
 bool AdvanceOneSecond()
 {
@@ -884,10 +900,10 @@ bool AdvanceOneSecond()
       cur_bar[0].low  = cur_m1.low;
    }
 
-   cur_bar[0].close        = live_price;
-   cur_bar[0].tick_volume  = MathMax(1, (long)((cur_m1.tick_volume * (g_sub_sec + 1)) / 60));
-   cur_bar[0].spread       = cur_m1.spread;
-   cur_bar[0].real_volume  = cur_m1.real_volume;
+   cur_bar[0].close       = live_price;
+   cur_bar[0].tick_volume = MathMax(1, (long)((cur_m1.tick_volume * (g_sub_sec + 1)) / 60));
+   cur_bar[0].spread      = cur_m1.spread;
+   cur_bar[0].real_volume = cur_m1.real_volume;
 
    if(CustomRatesUpdate(_Symbol, cur_bar) < 0)
    {
@@ -923,7 +939,7 @@ double InterpolatePrice(const MqlRates &bar, const int sec)
 
    bool isBull = (bar.close >= bar.open);
    double p0 = bar.open;
-   double p1 = isBull ? bar.low : bar.high;
+   double p1 = isBull ? bar.low  : bar.high;
    double p2 = isBull ? bar.high : bar.low;
    double p3 = bar.close;
 
@@ -945,7 +961,7 @@ double InterpolatePrice(const MqlRates &bar, const int sec)
 }
 
 //+------------------------------------------------------------------+
-//| Advance Replay by 1 Full M1 Bar                                  |
+//| Advance Replay by 1 Full M1 Bar                                   |
 //+------------------------------------------------------------------+
 bool AdvanceOneFullBar()
 {
@@ -954,7 +970,7 @@ bool AdvanceOneFullBar()
 
    MqlRates one[1];
    one[0] = g_m1[idx + 1];
-   g_cursor = one[0].time;
+   g_cursor  = one[0].time;
    g_sub_sec = 59;
 
    if(CustomRatesUpdate(_Symbol, one) < 0)
@@ -969,7 +985,7 @@ bool AdvanceOneFullBar()
 
    double prices[4];
    prices[0] = one[0].open;
-   prices[1] = isBull ? one[0].low : one[0].high;
+   prices[1] = isBull ? one[0].low  : one[0].high;
    prices[2] = isBull ? one[0].high : one[0].low;
    prices[3] = one[0].close;
 
@@ -993,7 +1009,7 @@ bool AdvanceOneFullBar()
 }
 
 //+------------------------------------------------------------------+
-//| Binary search bar matching cursor time                           |
+//| Binary search bar matching cursor time                            |
 //+------------------------------------------------------------------+
 int FindBar(const datetime t)
 {
@@ -1008,7 +1024,7 @@ int FindBar(const datetime t)
 }
 
 //+------------------------------------------------------------------+
-//| Spread in price units                                            |
+//| Spread in price units                                              |
 //+------------------------------------------------------------------+
 double SpreadPx()
 {
@@ -1016,7 +1032,7 @@ double SpreadPx()
 }
 
 //+------------------------------------------------------------------+
-//| Execute Virtual Position Entry                                   |
+//| Execute Virtual Position Entry & DrawDown Entries                 |
 //+------------------------------------------------------------------+
 void OpenVirt(const ENUM_SIDE side)
 {
@@ -1028,17 +1044,17 @@ void OpenVirt(const ENUM_SIDE side)
    {
       double spd_val = SpreadPx();
       double live_price = InterpolatePrice(g_m1[cur_idx], g_sub_sec);
-      t.bid = live_price;
-      t.ask = t.bid + spd_val;
+      t.bid  = live_price;
+      t.ask  = t.bid + spd_val;
       t.last = t.bid;
    }
 
    double lot_min = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
    if(lot_min <= 0) lot_min = 0.01;
-   double lots     = MathMax(lot_min, EditNum(UI + "ED_LOT"));
-   int slpts       = (int)MathMax(0, EditNum(UI + "ED_SL_PTS"));
-   int tppts       = (int)MathMax(0, EditNum(UI + "ED_TP_PTS"));
-   int partials    = (int)MathMax(0, MathMin(MAX_PARTIALS, EditNum(UI + "ED_PARTIALS")));
+   double lots = MathMax(lot_min, EditNum(UI + "ED_LOT"));
+   int slpts = (int)MathMax(0, EditNum(UI + "ED_SL_PTS"));
+   int tppts = (int)MathMax(0, EditNum(UI + "ED_TP_PTS"));
+   int partials = (int)MathMax(0, MathMin(MAX_PARTIALS, EditNum(UI + "ED_PARTIALS")));
    int be_after_cfg= (int)MathMax(1, EditNum(UI + "ED_BE_AFTER"));
 
    double entry = (side == SIDE_BUY ? t.ask : t.bid);
@@ -1047,29 +1063,70 @@ void OpenVirt(const ENUM_SIDE side)
    if(slpts > 0) sl = (side == SIDE_BUY ? entry - slpts * _Point : entry + slpts * _Point);
    if(tppts > 0) tp = (side == SIDE_BUY ? entry + tppts * _Point : entry - tppts * _Point);
 
+   ulong group_id = g_next_group++;
+
+   // 1. Create the primary active execution (identical to the original behavior)
+   CreateSimPos(side, lots, entry, sl, tp, partials, be_after_cfg, false, group_id, false);
+
+   // 2. Queue the additional DrawDown limit orders (Pending), tagged with the
+   //    same group_id so they can be identified and cancelled together once
+   //    the main entry reaches its first partial target.
+   if(InpEnableDDEntries && InpDD_OrderCount > 0)
+   {
+      for(int k = 1; k <= InpDD_OrderCount; k++)
+      {
+         double p_dd = (side == SIDE_BUY) ? entry - (k * InpDD_Spacing * _Point) : entry + (k * InpDD_Spacing * _Point);
+         double sl_dd = 0;
+
+         if(InpDD_SameSL)
+         {
+            sl_dd = sl;
+         }
+         else
+         {
+            sl_dd = (slpts > 0) ? ((side == SIDE_BUY) ? p_dd - slpts * _Point : p_dd + slpts * _Point) : 0;
+         }
+
+         double tp_dd = (tppts > 0) ? ((side == SIDE_BUY) ? p_dd + tppts * _Point : p_dd - tppts * _Point) : 0;
+
+         CreateSimPos(side, lots, p_dd, sl_dd, tp_dd, partials, be_after_cfg, true, group_id, true);
+      }
+   }
+
+   SaveFullSessionState();
+}
+
+//+------------------------------------------------------------------+
+//| Create a single position record (main entry OR a DD limit order) |
+//+------------------------------------------------------------------+
+void CreateSimPos(ENUM_SIDE side, double lots, double entry, double sl, double tp, int partials, int be_after_cfg, bool is_pending, ulong group_id, bool is_dd_entry)
+{
    if(partials > 0 && tp == 0)
       partials = 0;
 
    int n = ArraySize(g_pos);
    ArrayResize(g_pos, n + 1);
 
-   g_pos[n].ticket        = g_next++;
-   g_pos[n].side          = side;
-   g_pos[n].lots          = lots;
-   g_pos[n].orig_lots     = lots;
-   g_pos[n].price         = entry;
-   g_pos[n].sl            = sl;
-   g_pos[n].orig_sl       = sl;
-   g_pos[n].tp            = tp;
-   g_pos[n].open_time     = g_cursor + g_sub_sec;
-   g_pos[n].close_time    = 0;
-   g_pos[n].close_price   = 0;
-   g_pos[n].pnl           = 0;
-   g_pos[n].open          = true;
-   g_pos[n].partials      = partials;
-   g_pos[n].be_after      = (partials > 0) ? MathMin(partials, be_after_cfg) : 1;
-   g_pos[n].next_partial  = 1;
-   g_pos[n].be_done       = false;
+   g_pos[n].ticket            = g_next++;
+   g_pos[n].group_id          = group_id;
+   g_pos[n].side              = side;
+   g_pos[n].lots              = lots;
+   g_pos[n].orig_lots         = lots;
+   g_pos[n].price             = entry;
+   g_pos[n].sl                = sl;
+   g_pos[n].orig_sl           = sl;
+   g_pos[n].tp                = tp;
+   g_pos[n].open_time         = g_cursor + g_sub_sec;
+   g_pos[n].close_time        = 0;
+   g_pos[n].close_price       = 0;
+   g_pos[n].pnl               = 0;
+   g_pos[n].open              = true;
+   g_pos[n].is_pending        = is_pending;
+   g_pos[n].is_dd_entry       = is_dd_entry;
+   g_pos[n].partials          = partials;
+   g_pos[n].be_after          = (partials > 0) ? MathMin(partials, be_after_cfg) : 1;
+   g_pos[n].next_partial      = 1;
+   g_pos[n].be_done           = false;
    g_pos[n].shot_on_open_done = false;
    g_pos[n].open_shot_file    = "";
 
@@ -1081,10 +1138,35 @@ void OpenVirt(const ENUM_SIDE side)
          g_pos[n].plevels[k - 1] = entry + dist * ((double)k / partials);
    }
 
-   g_selected_idx = n;
    DrawOrder(n);
-   JournalOpen(n);
-   SaveFullSessionState();
+
+   // Only journal + select the primary execution immediately. Pending DD limit
+   // orders get journaled once they actually trigger (see CheckPartialsAndStops).
+   if(!is_pending)
+   {
+      g_selected_idx = n;
+      JournalOpen(n);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Cancel remaining pending DD limit orders for a trade group        |
+//| Called once the main entry hits its first partial target - the   |
+//| DD entries are no longer needed once price has moved into profit.|
+//+------------------------------------------------------------------+
+void CancelRemainingDDOrders(const ulong group_id)
+{
+   for(int i = 0; i < ArraySize(g_pos); i++)
+   {
+      if(!g_pos[i].open) continue;
+      if(!g_pos[i].is_pending) continue;
+      if(!g_pos[i].is_dd_entry) continue;
+      if(g_pos[i].group_id != group_id) continue;
+
+      g_pos[i].open = false;
+      DeleteAllPositionObjects(g_pos[i].ticket);
+      JournalRow("CANCEL", i, g_pos[i].price, 0.0, "dd_cancel_on_first_partial", "");
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -1092,17 +1174,18 @@ void OpenVirt(const ENUM_SIDE side)
 //+------------------------------------------------------------------+
 void CheckWorstSL(const double live_bid, const double live_ask)
 {
-   int buyCount  = 0;
+   int buyCount = 0;
    int sellCount = 0;
-   int worstBuy  = -1;
+   int worstBuy = -1;
    int worstSell = -1;
-   double worstBuyPnl  = DBL_MAX;
+   double worstBuyPnl = DBL_MAX;
    double worstSellPnl = DBL_MAX;
 
-   // Evaluate each individual open trade's floating PnL
+   // Evaluate each individual open trade's floating PnL (pending DD limit
+   // orders are skipped - they are not live positions yet)
    for(int i = 0; i < ArraySize(g_pos); i++)
    {
-      if(!g_pos[i].open) continue;
+      if(!g_pos[i].open || g_pos[i].is_pending) continue;
 
       double cur = (g_pos[i].side == SIDE_BUY ? live_bid : live_ask);
       double pnl = MoneyPnl(g_pos[i].side, g_pos[i].price, cur, g_pos[i].lots);
@@ -1151,6 +1234,28 @@ void CheckPartialsAndStops(const double highPrice, const double lowPrice)
    {
       if(!g_pos[i].open) continue;
 
+      // Pending DrawDown limit order evaluation - check if price reached the
+      // limit price and, if so, turn it into a live position.
+      if(g_pos[i].is_pending)
+      {
+         bool triggered = false;
+         if(g_pos[i].side == SIDE_BUY  && lowPrice  <= g_pos[i].price) triggered = true;
+         if(g_pos[i].side == SIDE_SELL && highPrice >= g_pos[i].price) triggered = true;
+
+         if(triggered)
+         {
+            g_pos[i].is_pending = false;
+            g_pos[i].open_time  = g_cursor + g_sub_sec;
+            DeleteAllPositionObjects(g_pos[i].ticket); // clear pending visual layout
+            DrawOrder(i);      // Redraw as an active/live trade
+            JournalOpen(i);    // Journal the live execution
+            SaveFullSessionState();
+         }
+         continue; // Prevent checking SL/TP on the exact same tick it triggered
+      }
+
+      bool firstPartialJustHit = false;
+
       while(g_pos[i].open && g_pos[i].partials > 0 && g_pos[i].next_partial <= g_pos[i].partials)
       {
          int k = g_pos[i].next_partial;
@@ -1159,8 +1264,10 @@ void CheckPartialsAndStops(const double highPrice, const double lowPrice)
          if(!hit) break;
 
          double closeLots = (k == g_pos[i].partials)
-                            ? g_pos[i].lots
-                            : MathMin(g_pos[i].lots, g_pos[i].orig_lots / g_pos[i].partials);
+                             ? g_pos[i].lots
+                             : MathMin(g_pos[i].lots, g_pos[i].orig_lots / g_pos[i].partials);
+
+         if(k == 1) firstPartialJustHit = true;
 
          PartialClose(i, lvl, closeLots, k);
 
@@ -1169,6 +1276,14 @@ void CheckPartialsAndStops(const double highPrice, const double lowPrice)
             MoveSlToBreakeven(i);
 
          g_pos[i].next_partial++;
+      }
+
+      // Requirement: as soon as price hits the FIRST partial of the main entry,
+      // automatically cancel all remaining (not yet triggered) DD limit orders
+      // that belong to the same trade group.
+      if(firstPartialJustHit && InpDD_CancelOnFirstPartial && !g_pos[i].is_dd_entry)
+      {
+         CancelRemainingDDOrders(g_pos[i].group_id);
       }
 
       if(!g_pos[i].open) continue;
@@ -1207,7 +1322,7 @@ void CheckPartialsAndStops(const double highPrice, const double lowPrice)
 }
 
 //+------------------------------------------------------------------+
-//| Breakeven SL Adjustment                                          |
+//| Breakeven SL Adjustment                                            |
 //+------------------------------------------------------------------+
 void MoveSlToBreakeven(const int i)
 {
@@ -1217,7 +1332,7 @@ void MoveSlToBreakeven(const int i)
 }
 
 //+------------------------------------------------------------------+
-//| Execute Partial Close                                            |
+//| Execute Partial Close                                              |
 //+------------------------------------------------------------------+
 void PartialClose(const int i, const double price, const double closeLots, const int legIndex)
 {
@@ -1225,10 +1340,10 @@ void PartialClose(const int i, const double price, const double closeLots, const
    if(lots <= 0) return;
 
    double pnl = MoneyPnl(g_pos[i].side, g_pos[i].price, price, lots);
-   g_pos[i].lots   -= lots;
-   g_pos[i].pnl    += pnl;
-   g_balance       += pnl;
-   g_closed_pnl    += pnl;
+   g_pos[i].lots -= lots;
+   g_pos[i].pnl += pnl;
+   g_balance += pnl;
+   g_closed_pnl += pnl;
 
    // Remove the partial line that was just reached
    ObjectDelete(0, Tag(g_pos[i].ticket, "P" + IntegerToString(legIndex)));
@@ -1238,7 +1353,7 @@ void PartialClose(const int i, const double price, const double closeLots, const
    {
       g_pos[i].open = false;
       g_pos[i].close_price = price;
-      g_pos[i].close_time  = g_cursor + g_sub_sec;
+      g_pos[i].close_time = g_cursor + g_sub_sec;
       if(g_pos[i].pnl >= 0) g_wins++; else g_losses++;
       JournalClose(i, "TP");
       DeleteAllPositionObjects(g_pos[i].ticket);
@@ -1251,11 +1366,11 @@ void PartialClose(const int i, const double price, const double closeLots, const
 }
 
 //+------------------------------------------------------------------+
-//| Execute Manual Partial Percentage on Selected Position           |
+//| Execute Manual Partial Percentage on Selected Position            |
 //+------------------------------------------------------------------+
 void ExecuteManualPartialPercent(const double pct)
 {
-   if(g_selected_idx < 0 || g_selected_idx >= ArraySize(g_pos) || !g_pos[g_selected_idx].open)
+   if(g_selected_idx < 0 || g_selected_idx >= ArraySize(g_pos) || !g_pos[g_selected_idx].open || g_pos[g_selected_idx].is_pending)
       return;
 
    double closeLots = g_pos[g_selected_idx].lots * (pct / 100.0);
@@ -1263,11 +1378,19 @@ void ExecuteManualPartialPercent(const double pct)
 
    int cur_idx = FindBar(g_cursor);
    double px = (g_pos[g_selected_idx].side == SIDE_BUY ? g_m1[cur_idx].close : g_m1[cur_idx].close + SpreadPx());
+
+   bool  wasFirst = (g_pos[g_selected_idx].next_partial == 1);
+   ulong gid       = g_pos[g_selected_idx].group_id;
+   bool  isDd      = g_pos[g_selected_idx].is_dd_entry;
+
    PartialClose(g_selected_idx, px, closeLots, g_pos[g_selected_idx].next_partial++);
+
+   if(wasFirst && InpDD_CancelOnFirstPartial && !isDd)
+      CancelRemainingDDOrders(gid);
 }
 
 //+------------------------------------------------------------------+
-//| Close all open simulator positions                               |
+//| Close all open simulator positions (cancels pending DD orders too)|
 //+------------------------------------------------------------------+
 void CloseAll(const string reason)
 {
@@ -1286,13 +1409,21 @@ void CloseAll(const string reason)
    for(int i = 0; i < ArraySize(g_pos); i++)
    {
       if(!g_pos[i].open) continue;
+
+      if(g_pos[i].is_pending)
+      {
+         g_pos[i].open = false;
+         DeleteAllPositionObjects(g_pos[i].ticket);
+         continue;
+      }
+
       double px = (g_pos[i].side == SIDE_BUY ? t.bid : t.ask);
       CloseOne(i, px, reason);
    }
 }
 
 //+------------------------------------------------------------------+
-//| Close single position (Removes all chart visuals completely)     |
+//| Close single position (Removes all chart visuals completely)      |
 //+------------------------------------------------------------------+
 void CloseOne(const int i, const double price, const string reason)
 {
@@ -1301,13 +1432,13 @@ void CloseOne(const int i, const double price, const string reason)
    double pnl = MoneyPnl(g_pos[i].side, g_pos[i].price, price, g_pos[i].lots);
    g_pos[i].open = false;
    g_pos[i].close_price = price;
-   g_pos[i].close_time  = g_cursor + g_sub_sec;
+   g_pos[i].close_time = g_cursor + g_sub_sec;
    g_pos[i].pnl += pnl;
    g_balance += pnl;
    g_closed_pnl += pnl;
 
    if(g_pos[i].pnl >= 0) g_wins++; else g_losses++;
-   
+
    JournalClose(i, reason);
    DeleteAllPositionObjects(g_pos[i].ticket);
 
@@ -1318,7 +1449,7 @@ void CloseOne(const int i, const double price, const string reason)
 }
 
 //+------------------------------------------------------------------+
-//| Monetary PnL Calculation                                         |
+//| Monetary PnL Calculation                                           |
 //+------------------------------------------------------------------+
 double MoneyPnl(const ENUM_SIDE side, const double entry, const double exit, const double lots)
 {
@@ -1330,7 +1461,7 @@ double MoneyPnl(const ENUM_SIDE side, const double entry, const double exit, con
 }
 
 //+------------------------------------------------------------------+
-//| Mark To Market Floating Equity                                   |
+//| Mark To Market Floating Equity                                     |
 //+------------------------------------------------------------------+
 void MarkToMarket()
 {
@@ -1349,7 +1480,7 @@ void MarkToMarket()
    double floating = 0;
    for(int i = 0; i < ArraySize(g_pos); i++)
    {
-      if(!g_pos[i].open) continue;
+      if(!g_pos[i].open || g_pos[i].is_pending) continue;
       double cur = (g_pos[i].side == SIDE_BUY ? t.bid : t.ask);
       floating += MoneyPnl(g_pos[i].side, g_pos[i].price, cur, g_pos[i].lots);
    }
@@ -1361,7 +1492,7 @@ void MarkToMarket()
 }
 
 //+------------------------------------------------------------------+
-//| Object Tag Helper                                                |
+//| Object Tag Helper                                                  |
 //+------------------------------------------------------------------+
 string Tag(const ulong ticket, const string suffix)
 {
@@ -1369,26 +1500,27 @@ string Tag(const ulong ticket, const string suffix)
 }
 
 //+------------------------------------------------------------------+
-//| Remove all chart objects created for a specific ticket           |
+//| Remove all chart objects created for a specific ticket            |
 //+------------------------------------------------------------------+
 void DeleteAllPositionObjects(const ulong ticket)
 {
    string prefix = UI + "ORD_" + IntegerToString((long)ticket) + "_";
-   
+
    // Exact named deletion
    ObjectDelete(0, prefix + "IN");
+   ObjectDelete(0, prefix + "PENDING");
    ObjectDelete(0, prefix + "LABEL");
    ObjectDelete(0, prefix + "SL");
    ObjectDelete(0, prefix + "TP");
    ObjectDelete(0, prefix + "OUT");
    ObjectDelete(0, prefix + "SEG");
-   
+
    for(int k = 1; k <= MAX_PARTIALS; k++)
    {
       ObjectDelete(0, prefix + "P" + IntegerToString(k));
       ObjectDelete(0, prefix + "PX" + IntegerToString(k));
    }
-   
+
    // Full prefix cleanup scan across chart
    int total = ObjectsTotal(0, 0, -1);
    for(int i = total - 1; i >= 0; i--)
@@ -1400,7 +1532,7 @@ void DeleteAllPositionObjects(const ulong ticket)
 }
 
 //+------------------------------------------------------------------+
-//| Remove any residual objects of closed trades from the chart      |
+//| Remove any residual objects of closed trades from the chart       |
 //+------------------------------------------------------------------+
 void CleanAllClosedTradeObjects()
 {
@@ -1412,7 +1544,7 @@ void CleanAllClosedTradeObjects()
 }
 
 //+------------------------------------------------------------------+
-//| Recreate Graphical Orders for currently OPEN positions only      |
+//| Recreate Graphical Orders for currently OPEN positions only       |
 //+------------------------------------------------------------------+
 void RedrawAllOpenOrders()
 {
@@ -1426,13 +1558,29 @@ void RedrawAllOpenOrders()
 }
 
 //+------------------------------------------------------------------+
-//| Chart Order Graphics (Draws only remaining active partial levels)|
+//| Chart Order Graphics (Handles Active AND Pending DrawDowns)       |
 //+------------------------------------------------------------------+
 void DrawOrder(const int i)
 {
    if(!g_pos[i].open) return;
 
    color col = (g_pos[i].side == SIDE_BUY ? CLR_BUY_GREEN : CLR_SELL_RED);
+
+   if(g_pos[i].is_pending)
+   {
+      string label = Tag(g_pos[i].ticket, "LABEL");
+      ObjectCreate(0, label, OBJ_TEXT, 0, g_pos[i].open_time, g_pos[i].price);
+      ObjectSetString(0, label, OBJPROP_TEXT, StringFormat(" LIMIT #%I64u %s %.2f", g_pos[i].ticket, g_pos[i].side == SIDE_BUY ? "BUY" : "SELL", g_pos[i].orig_lots));
+      ObjectSetInteger(0, label, OBJPROP_COLOR, clrDarkGray);
+      ObjectSetInteger(0, label, OBJPROP_FONTSIZE, 8);
+      ObjectSetInteger(0, label, OBJPROP_ANCHOR, ANCHOR_LEFT_LOWER);
+
+      OrderLine(Tag(g_pos[i].ticket, "PENDING"), g_pos[i].open_time, g_pos[i].price, clrDarkGray, "LIMIT");
+      if(g_pos[i].sl > 0) OrderLine(Tag(g_pos[i].ticket, "SL"), g_pos[i].open_time, g_pos[i].sl, clrDarkGray, "L_SL");
+      if(g_pos[i].tp > 0) OrderLine(Tag(g_pos[i].ticket, "TP"), g_pos[i].open_time, g_pos[i].tp, clrDarkGray, "L_TP");
+      return;
+   }
+
    string a = Tag(g_pos[i].ticket, "IN");
    ObjectCreate(0, a, OBJ_ARROW, 0, g_pos[i].open_time, g_pos[i].price);
    ObjectSetInteger(0, a, OBJPROP_ARROWCODE, g_pos[i].side == SIDE_BUY ? 233 : 234);
@@ -1493,7 +1641,7 @@ void RedrawSlLine(const int i)
 }
 
 //+------------------------------------------------------------------+
-//| Trade Journaling Initialization                                  |
+//| Trade Journaling Initialization                                    |
 //+------------------------------------------------------------------+
 void InitJournal()
 {
@@ -1513,7 +1661,7 @@ void InitJournal()
 }
 
 //+------------------------------------------------------------------+
-//| Compact Native Chart Screenshot Capture                          |
+//| Compact Native Chart Screenshot Capture                            |
 //+------------------------------------------------------------------+
 string CaptureChartScreenshot(const ulong ticket)
 {
@@ -1523,8 +1671,8 @@ string CaptureChartScreenshot(const ulong ticket)
    MqlDateTime dt; TimeToStruct(full_t, dt);
 
    string rel_path = StringFormat("%s\\%s_%I64u_OPEN_%04d%02d%02d_%02d%02d%02d.png",
-                                  JOURNAL_DIR, _Symbol, ticket,
-                                  dt.year, dt.mon, dt.day, dt.hour, dt.min, dt.sec);
+                                   JOURNAL_DIR, _Symbol, ticket,
+                                   dt.year, dt.mon, dt.day, dt.hour, dt.min, dt.sec);
 
    int sw = (InpShotW > 0 ? InpShotW : 960);
    int sh = (InpShotH > 0 ? InpShotH : 540);
@@ -1536,7 +1684,7 @@ string CaptureChartScreenshot(const ulong ticket)
 }
 
 //+------------------------------------------------------------------+
-//| Journal Row Writing                                              |
+//| Journal Row Writing                                                |
 //+------------------------------------------------------------------+
 void JournalRow(const string event, const int i, const double price, const double pnl, const string reason, const string shot)
 {
@@ -1586,7 +1734,7 @@ int CountOpen()
 {
    int n = 0;
    for(int i = 0; i < ArraySize(g_pos); i++)
-      if(g_pos[i].open) n++;
+      if(g_pos[i].open && !g_pos[i].is_pending) n++;
    return n;
 }
 
@@ -1599,24 +1747,25 @@ int CountClosed()
 }
 
 //+------------------------------------------------------------------+
-//| Full Session State Persistence across Timeframe Changes          |
+//| Full Session State Persistence across Timeframe Changes           |
 //+------------------------------------------------------------------+
 void SaveFullSessionState()
 {
-   GlobalVariableSet("FR_FROM",   (double)g_from);
-   GlobalVariableSet("FR_TO",     (double)g_to);
-   GlobalVariableSet("FR_CUR",    (double)g_cursor);
+   GlobalVariableSet("FR_FROM", (double)g_from);
+   GlobalVariableSet("FR_TO", (double)g_to);
+   GlobalVariableSet("FR_CUR", (double)g_cursor);
    GlobalVariableSet("FR_SUBSEC", (double)g_sub_sec);
-   GlobalVariableSet("FR_BAL",    g_balance);
-   GlobalVariableSet("FR_EQ",     g_equity);
-   GlobalVariableSet("FR_PEAK",   g_peak);
-   GlobalVariableSet("FR_MDD",    g_maxdd);
-   GlobalVariableSet("FR_CPNL",   g_closed_pnl);
-   GlobalVariableSet("FR_SPD",    (double)g_speed);
-   GlobalVariableSet("FR_PLAY",   g_playing ? 1.0 : 0.0);
-   GlobalVariableSet("FR_NEXT",   (double)g_next);
-   GlobalVariableSet("FR_WINS",   (double)g_wins);
-   GlobalVariableSet("FR_LOSS",   (double)g_losses);
+   GlobalVariableSet("FR_BAL", g_balance);
+   GlobalVariableSet("FR_EQ", g_equity);
+   GlobalVariableSet("FR_PEAK", g_peak);
+   GlobalVariableSet("FR_MDD", g_maxdd);
+   GlobalVariableSet("FR_CPNL", g_closed_pnl);
+   GlobalVariableSet("FR_SPD", (double)g_speed);
+   GlobalVariableSet("FR_PLAY", g_playing ? 1.0 : 0.0);
+   GlobalVariableSet("FR_NEXT", (double)g_next);
+   GlobalVariableSet("FR_NEXTGRP", (double)g_next_group);
+   GlobalVariableSet("FR_WINS", (double)g_wins);
+   GlobalVariableSet("FR_LOSS", (double)g_losses);
 
    int h = FileOpen(STATE_CSV, FILE_WRITE | FILE_CSV | FILE_ANSI, ';');
    if(h != INVALID_HANDLE)
@@ -1631,6 +1780,7 @@ void SaveFullSessionState()
 
          FileWrite(h,
                    IntegerToString((long)g_pos[i].ticket),
+                   IntegerToString((long)g_pos[i].group_id),
                    (int)g_pos[i].side,
                    DoubleToString(g_pos[i].lots, 4),
                    DoubleToString(g_pos[i].orig_lots, 4),
@@ -1643,13 +1793,15 @@ void SaveFullSessionState()
                    DoubleToString(g_pos[i].close_price, _Digits),
                    DoubleToString(g_pos[i].pnl, 2),
                    g_pos[i].open ? 1 : 0,
+                   g_pos[i].is_dd_entry ? 1 : 0,
                    g_pos[i].partials,
                    g_pos[i].be_after,
                    g_pos[i].next_partial,
                    plevelsStr,
                    g_pos[i].be_done ? 1 : 0,
                    g_pos[i].shot_on_open_done ? 1 : 0,
-                   g_pos[i].open_shot_file);
+                   g_pos[i].open_shot_file,
+                   g_pos[i].is_pending ? 1 : 0);
       }
       FileClose(h);
    }
@@ -1659,22 +1811,23 @@ bool LoadFullSessionState()
 {
    if(!GlobalVariableCheck("FR_FROM")) return false;
 
-   g_from       = (datetime)GlobalVariableGet("FR_FROM");
-   g_to         = (datetime)GlobalVariableGet("FR_TO");
-   g_cursor     = (datetime)GlobalVariableGet("FR_CUR");
-   g_sub_sec    = (int)GlobalVariableGet("FR_SUBSEC");
-   g_balance    = GlobalVariableGet("FR_BAL");
-   g_equity     = GlobalVariableGet("FR_EQ");
-   g_peak       = GlobalVariableGet("FR_PEAK");
-   g_maxdd      = GlobalVariableGet("FR_MDD");
+   g_from = (datetime)GlobalVariableGet("FR_FROM");
+   g_to = (datetime)GlobalVariableGet("FR_TO");
+   g_cursor = (datetime)GlobalVariableGet("FR_CUR");
+   g_sub_sec = (int)GlobalVariableGet("FR_SUBSEC");
+   g_balance = GlobalVariableGet("FR_BAL");
+   g_equity = GlobalVariableGet("FR_EQ");
+   g_peak = GlobalVariableGet("FR_PEAK");
+   g_maxdd = GlobalVariableGet("FR_MDD");
    g_closed_pnl = GlobalVariableGet("FR_CPNL");
-   g_speed      = (int)GlobalVariableGet("FR_SPD");
-   g_playing    = (GlobalVariableGet("FR_PLAY") > 0.5);
-   g_next       = (ulong)GlobalVariableGet("FR_NEXT");
-   g_wins       = (int)GlobalVariableGet("FR_WINS");
-   g_losses     = (int)GlobalVariableGet("FR_LOSS");
+   g_speed = (int)GlobalVariableGet("FR_SPD");
+   g_playing = (GlobalVariableGet("FR_PLAY") > 0.5);
+   g_next = (ulong)GlobalVariableGet("FR_NEXT");
+   g_next_group = GlobalVariableCheck("FR_NEXTGRP") ? (ulong)GlobalVariableGet("FR_NEXTGRP") : 1;
+   g_wins = (int)GlobalVariableGet("FR_WINS");
+   g_losses = (int)GlobalVariableGet("FR_LOSS");
 
-   g_sim    = _Symbol;
+   g_sim = _Symbol;
    g_source = StringSubstr(_Symbol, StringLen(SIM_PREF));
 
    if(FileIsExist(STATE_CSV))
@@ -1686,21 +1839,23 @@ bool LoadFullSessionState()
          ArrayResize(g_pos, posCount);
          for(int i = 0; i < posCount; i++)
          {
-            g_pos[i].ticket     = (ulong)StringToInteger(FileReadString(h));
-            g_pos[i].side       = (ENUM_SIDE)StringToInteger(FileReadString(h));
-            g_pos[i].lots       = StringToDouble(FileReadString(h));
-            g_pos[i].orig_lots  = StringToDouble(FileReadString(h));
-            g_pos[i].price      = StringToDouble(FileReadString(h));
-            g_pos[i].sl         = StringToDouble(FileReadString(h));
-            g_pos[i].orig_sl    = StringToDouble(FileReadString(h));
-            g_pos[i].tp         = StringToDouble(FileReadString(h));
-            g_pos[i].open_time  = (datetime)StringToInteger(FileReadString(h));
+            g_pos[i].ticket = (ulong)StringToInteger(FileReadString(h));
+            g_pos[i].group_id = (ulong)StringToInteger(FileReadString(h));
+            g_pos[i].side = (ENUM_SIDE)StringToInteger(FileReadString(h));
+            g_pos[i].lots = StringToDouble(FileReadString(h));
+            g_pos[i].orig_lots = StringToDouble(FileReadString(h));
+            g_pos[i].price = StringToDouble(FileReadString(h));
+            g_pos[i].sl = StringToDouble(FileReadString(h));
+            g_pos[i].orig_sl = StringToDouble(FileReadString(h));
+            g_pos[i].tp = StringToDouble(FileReadString(h));
+            g_pos[i].open_time = (datetime)StringToInteger(FileReadString(h));
             g_pos[i].close_time = (datetime)StringToInteger(FileReadString(h));
             g_pos[i].close_price= StringToDouble(FileReadString(h));
-            g_pos[i].pnl        = StringToDouble(FileReadString(h));
-            g_pos[i].open       = (StringToInteger(FileReadString(h)) == 1);
-            g_pos[i].partials   = (int)StringToInteger(FileReadString(h));
-            g_pos[i].be_after   = (int)StringToInteger(FileReadString(h));
+            g_pos[i].pnl = StringToDouble(FileReadString(h));
+            g_pos[i].open = (StringToInteger(FileReadString(h)) == 1);
+            g_pos[i].is_dd_entry = (StringToInteger(FileReadString(h)) == 1);
+            g_pos[i].partials = (int)StringToInteger(FileReadString(h));
+            g_pos[i].be_after = (int)StringToInteger(FileReadString(h));
             g_pos[i].next_partial = (int)StringToInteger(FileReadString(h));
 
             string plevelsStr = FileReadString(h);
@@ -1714,9 +1869,10 @@ bool LoadFullSessionState()
                   g_pos[i].plevels[k] = 0.0;
             }
 
-            g_pos[i].be_done            = (StringToInteger(FileReadString(h)) == 1);
-            g_pos[i].shot_on_open_done  = (StringToInteger(FileReadString(h)) == 1);
-            g_pos[i].open_shot_file     = FileReadString(h);
+            g_pos[i].be_done = (StringToInteger(FileReadString(h)) == 1);
+            g_pos[i].shot_on_open_done = (StringToInteger(FileReadString(h)) == 1);
+            g_pos[i].open_shot_file = FileReadString(h);
+            g_pos[i].is_pending = (StringToInteger(FileReadString(h)) == 1);
          }
          FileClose(h);
       }
@@ -1725,7 +1881,7 @@ bool LoadFullSessionState()
 }
 
 //+------------------------------------------------------------------+
-//| UI Graphic Object Helpers                                        |
+//| UI Graphic Object Helpers                                          |
 //+------------------------------------------------------------------+
 void CreateUIRect(const string name, int x, int y, int w, int h, color bg, color border)
 {
