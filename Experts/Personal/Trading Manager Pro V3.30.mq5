@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
-//|                                       TradeManager_v3.31.mq5       |
+//|                                       TradeManager_v3.33.mq5       |
 //|   Riy Tech — External trade adoption + per-position BE/Close     |
-//|   v3.31 — Added InpDD_SameSL flag for DrawDown Limit Orders      |
+//|   v3.33 — Dynamic DD Lot Scaling & Auto-Spacing to SL            |
 //+------------------------------------------------------------------+
 #property copyright "Riy Tech"
-#property version   "3.31"
+#property version   "3.33"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -53,10 +53,14 @@ input group "Inverse Order Settings"
 input int    InpInverseOffset   = 50;   // Inverse Pending Offset (points)
 
 input group "DrawDown Entries"
-input bool   InpEnableDDEntries = true; // Enable auto DrawDown Limit Orders
-input int    InpDD_OrderCount   = 2;    // Number of additional Limit Orders
-input int    InpDD_Spacing      = 200;  // Spacing between DD entries (points)
-input bool   InpDD_SameSL       = true; // Use same SL price for all DD entries
+input bool   InpEnableDDEntries   = true;  // Enable DrawDown Limit Orders
+input int    InpDD_OrderCount     = 4;     // Number of DD Limit Orders
+input bool   InpDD_AutoSpacingSL  = true;  // Auto-Space DD Orders Evenly to SL
+input int    InpDD_Spacing        = 200;   // Fixed Spacing (Points) [If Auto-Space is OFF]
+input bool   InpDD_SameSL         = true;  // Inherit Main Stop Loss for All DD Orders
+input bool   InpDD_ScaleLots      = true;  // Enable Dynamic DD Lot Scaling
+input double InpDD_LotStartPct    = 25.0;  // 1st DD Order Size (% OF Original Lot)
+input double InpDD_LotEndPct      = 100.0; // Last DD Order Size (% OF Original Lot)
 
 input group "Partial Settings"
 input double InpMainPartialVol    = 40.0;
@@ -210,12 +214,14 @@ void   CreatePanelElements(int x, int y);
 void   UpdatePanelUI();
 void   UpdateSLTPPrices(double entry);
 void   UpdateStats(double priceRef);
-void   UpdatePartialLine(int x, int y);
+void   UpdatePartialLine(int x, int &y); // Passed by reference for dynamic height
+int    PartialLinesHeight();
 int    PanelHeight();
 void   ToggleVisualization();
 void   DrawVisualization();
 void   DrawSideVis(double ep, ENUM_SIDE_UI side);
 void   ExecuteOrder();
+double NormaliseVolume(double vol);
 void   ManualPartial();
 void   CycleSelectedTrade(int direction);
 void   ValidateSelectedTicket();
@@ -251,6 +257,8 @@ void   ExportToCSV();
 void   RecalculateLotFromRisk();
 void   RecalculateRiskFromLot();
 void   UpdateSymbolCache();
+void   CancelAllLimitOrders();
+void   SetSLAllPositions(double slPrice);
 void   Btn (string n, int x, int y, int w, int h, string t, bool act, color b = COLOR_BTN);
 void   Rect(string n, int x, int y, int w, int h, color bg);
 void   Edit(string n, int x, int y, int w, int h, string t);
@@ -288,7 +296,8 @@ int OnInit()
 
    UpdateSymbolCache();
    LoadState();
-   RecalculateLotFromRisk(); 
+   
+   RecalculateRiskFromLot(); 
 
    trade.SetExpertMagicNumber(MAGIC);
    SyncPosStates();
@@ -297,9 +306,8 @@ int OnInit()
    RebuildPanel(true);
    UpdateSLTPPrices(SymbolInfoDouble(_Symbol, SYMBOL_ASK));
 
-   PrintFormat("[TM3 v3.31] Ready | BE after Partial#%d (+%dpts) | Trailing=%s | DD Entries=%s (SameSL=%s)",
-               InpBE_Trigger, InpBE_Offset, InpUseTrailingStop ? "ON" : "OFF", 
-               InpEnableDDEntries ? "ON" : "OFF", InpDD_SameSL ? "ON" : "OFF");
+   PrintFormat("[TM3 v3.33] Ready | DD Orders=%d (Scale=%s, AutoSpaceSL=%s)",
+               InpDD_OrderCount, InpDD_ScaleLots ? "ON" : "OFF", InpDD_AutoSpacingSL ? "ON" : "OFF");
    EventSetTimer(1);
    return INIT_SUCCEEDED;
 }
@@ -629,8 +637,7 @@ void OnChartEvent(const int id, const long &lp, const double &dp, const string &
       
       if(sp == g_prefix + "Edit_RiskPct")
       {
-         ui.riskPercent = StringToDouble(ObjectGetString(0, sp, OBJPROP_TEXT));
-         RecalculateLotFromRisk();
+         RecalculateRiskFromLot();
       }
       if(sp == g_prefix + "Edit_Lot")
       {
@@ -651,7 +658,7 @@ void OnChartEvent(const int id, const long &lp, const double &dp, const string &
       if(sp == g_prefix + "Edit_SL")
       {
          ui.slPoints = (int)StringToInteger(ObjectGetString(0, sp, OBJPROP_TEXT));
-         RecalculateLotFromRisk();
+         RecalculateRiskFromLot();
          UpdateSLTPPrices(entry);
       }
       if(sp == g_prefix + "Edit_TP")
@@ -667,7 +674,7 @@ void OnChartEvent(const int id, const long &lp, const double &dp, const string &
          { 
             ui.slPoints = (int)MathAbs((entry - p) / _Point); 
             ObjectSetString(0, g_prefix + "Edit_SL", OBJPROP_TEXT, IntegerToString(ui.slPoints)); 
-            RecalculateLotFromRisk();
+            RecalculateRiskFromLot();
          }
       }
       if(sp == g_prefix + "Edit_TP_Prc")
@@ -764,6 +771,43 @@ void PurgeClosedPosStates()
 }
 
 //+------------------------------------------------------------------+
+//| CANCEL ALL LIMIT ORDERS & SET ALL SL (Utility Methods)           |
+//+------------------------------------------------------------------+
+void CancelAllLimitOrders()
+{
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ot = OrderGetTicket(i);
+      if(OrderGetString(ORDER_SYMBOL) == _Symbol)
+      {
+         if(OrderGetInteger(ORDER_MAGIC) == MAGIC || InpMonitorExternal)
+         {
+            trade.OrderDelete(ot);
+         }
+      }
+   }
+}
+
+void SetSLAllPositions(double slPrice)
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(!posInfo.SelectByIndex(i)) continue;
+      if(posInfo.Symbol() != _Symbol) continue;
+      
+      bool isOwn = (posInfo.Magic() == MAGIC);
+      bool isExt = InpMonitorExternal && IsRegisteredExternal(posInfo.Ticket());
+      
+      if(isOwn || isExt)
+      {
+         trade.PositionModify(posInfo.Ticket(), slPrice, posInfo.TakeProfit());
+         int idx = FindPosStateIdx(posInfo.Identifier());
+         if(idx >= 0) g_PosStates[idx].beSet = true;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
 //| CORE: MANAGE POSITIONS                                           |
 //+------------------------------------------------------------------+
 void ManagePositions()
@@ -855,6 +899,12 @@ void ManagePositions()
       g_PosStates[stIdx].partialsTaken = nextPartial;
       if(InpEnableSounds) PlaySound(InpSoundPartial);
 
+      if(nextPartial == 1)
+      {
+         CancelAllLimitOrders();
+         SetSLAllPositions(NormaliseSL(open));
+      }
+
       if(InpBE_Trigger > 0 && nextPartial == InpBE_Trigger && !beSet)
       {
          if(posInfo.SelectByTicket(ticket))
@@ -933,7 +983,13 @@ void ManageTrailingStop()
 }
 
 //+------------------------------------------------------------------+
-//| ORDER EXECUTION                                                  |
+//| ORDER EXECUTION (UPDATED WITH DD SCALING & AUTO-SPACING)         |
+//+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| ORDER EXECUTION (UPDATED WITH CORRECT DD SCALING)                |
+//+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| ORDER EXECUTION (FIXED DD LOT SCALING SEQUENCE)                  |
 //+------------------------------------------------------------------+
 void ExecuteOrder()
 {
@@ -972,18 +1028,46 @@ void ExecuteOrder()
       if(InpEnableSounds) PlaySound(InpSoundEntry);
       if(ui.isVisualizing) ToggleVisualization();
 
-      //--- Execute Additional DrawDown (DD) Limit Orders ---
       if(InpEnableDDEntries && InpDD_OrderCount > 0)
       {
+         int dynamicSpacing = InpDD_Spacing;
+         if(InpDD_AutoSpacingSL && ui.slPoints > 0)
+         {
+            // Evenly divide the distance up to the Stop Loss
+            dynamicSpacing = ui.slPoints / (InpDD_OrderCount + 1);
+         }
+
          for(int i = 1; i <= InpDD_OrderCount; i++)
          {
-            double p_dd = (ui.side == UI_BUY) ? p - (i * InpDD_Spacing * _Point) : p + (i * InpDD_Spacing * _Point);
+            // 1. Calculate dynamic lot size for each DD order sequentially
+            double ddLot = ui.lotSize;
+            if(InpDD_ScaleLots)
+            {
+               double currentPct = InpDD_LotStartPct;
+               if(InpDD_OrderCount > 1)
+               {
+                  // Step through from Start % (for 1st DD order) to End % (for last DD order)
+                  currentPct = InpDD_LotStartPct + (InpDD_LotEndPct - InpDD_LotStartPct) * ((double)(i - 1) / (double)(InpDD_OrderCount - 1));
+               }
+               
+               // Apply percentage to original lot size
+               double multiplier = currentPct / 100.0;
+               ddLot = NormaliseVolume(ui.lotSize * multiplier);
+               
+               double minV = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+               double maxV = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+               if(ddLot < minV) ddLot = minV;
+               if(ddLot > maxV) ddLot = maxV;
+            }
+
+            // 2. Place limit orders using dynamic spacing
+            double p_dd = (ui.side == UI_BUY) ? p - (i * dynamicSpacing * _Point) : p + (i * dynamicSpacing * _Point);
             p_dd = NormaliseSL(p_dd);
             
             double sl_dd = 0;
             if(InpDD_SameSL) 
             {
-               sl_dd = sl; // Inherit main order SL
+               sl_dd = sl; 
             } 
             else 
             {
@@ -993,28 +1077,55 @@ void ExecuteOrder()
             double tp_dd = (ui.side == UI_BUY) ? p_dd + ui.tpPoints * _Point : p_dd - ui.tpPoints * _Point;
             
             if(ui.side == UI_BUY) 
-               trade.BuyLimit(ui.lotSize, p_dd, _Symbol, sl_dd, tp_dd, ORDER_TIME_GTC, 0, "TM3_DD");
+               trade.BuyLimit(ddLot, p_dd, _Symbol, sl_dd, tp_dd, ORDER_TIME_GTC, 0, "TM3_DD");
             else 
-               trade.SellLimit(ui.lotSize, p_dd, _Symbol, sl_dd, tp_dd, ORDER_TIME_GTC, 0, "TM3_DD");
+               trade.SellLimit(ddLot, p_dd, _Symbol, sl_dd, tp_dd, ORDER_TIME_GTC, 0, "TM3_DD");
          }
       }
    }
 }
-
 double NormaliseVolume(double vol)
 {
    double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
    return MathFloor(vol / step) * step;
 }
 
+//+------------------------------------------------------------------+
+//| GOAL 2: NEW SET BREAKEVEN LOGIC                                  |
+//+------------------------------------------------------------------+
 void SetBreakEvenManual()
 {
-   if(g_SelectedTicket == 0)
+   datetime latestTime = 0;
+   ulong latestTicket = 0;
+   double latestOpenPrice = 0;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
-      Alert("[TM3] No trade selected. Use the Trade Selector to pick a ticket first.");
-      return;
+      if(!posInfo.SelectByIndex(i)) continue;
+      if(posInfo.Symbol() != _Symbol) continue;
+      
+      bool isOwn = (posInfo.Magic() == MAGIC);
+      bool isExt = InpMonitorExternal && IsRegisteredExternal(posInfo.Ticket());
+      if(!isOwn && !isExt) continue;
+      
+      if((datetime)posInfo.Time() > latestTime)
+      {
+         latestTime = (datetime)posInfo.Time();
+         latestTicket = posInfo.Ticket();
+         latestOpenPrice = posInfo.PriceOpen();
+      }
    }
-   SetBreakEvenTicket(g_SelectedTicket);
+
+   if(latestTicket > 0)
+   {
+      CancelAllLimitOrders();
+      SetSLAllPositions(NormaliseSL(latestOpenPrice));
+      if(InpEnableSounds) PlaySound(InpSoundBE);
+   }
+   else
+   {
+      Alert("[TM3] No managed open trades found to set BE.");
+   }
 }
 
 void SetBreakEvenTicket(ulong ticket)
@@ -1541,11 +1652,19 @@ void ClearState()
 }
 
 //+------------------------------------------------------------------+
-//| GUI PANEL                                                        |
+//| GUI PANEL DYNAMIC HEIGHT CALCULATION                             |
 //+------------------------------------------------------------------+
+int PartialLinesHeight()
+{
+   if(ui.partialsCount <= 0 || ui.tpPoints <= 0) return 18;
+   int lines = ((ui.partialsCount - 1) / 4) + 1;
+   return 14 * lines + 4;
+}
+
 int PanelHeight()
 {
-   return 580 + PositionListHeight() + 20;
+   // Dynamically scale panel based on number of wrapped partial lines
+   return 562 + PartialLinesHeight() + PositionListHeight() + 20;
 }
 
 int PositionListHeight()
@@ -1605,8 +1724,7 @@ void CreatePanelElements(int x, int y)
    Rect("Sep3", x+5, y, PANEL_W-10, 1, C'80,80,80');
    y += 5;
 
-   UpdatePartialLine(x, y);
-   y += 18;
+   UpdatePartialLine(x, y); 
 
    Rect("Sep1", x+5, y, PANEL_W-10, 1, C'60,60,60');
    y += 5;
@@ -1634,7 +1752,7 @@ void CreatePanelElements(int x, int y)
    Edit("Edit_ManPart", x+5, y, 50, ROW_H, "20");
    Btn("Btn_Part", x+60, y, 165, ROW_H, "PARTIAL % (SEL)", false, C'80,80,0');
    y += ROW_H + PAD;
-   Btn("Btn_BE", x+5, y, 110, ROW_H, "BE (SEL)", false, C'0,80,80');
+   Btn("Btn_BE", x+5, y, 110, ROW_H, "BE ALL (LATEST)", false, C'0,80,80');
    Btn("Btn_CloseSel", x+115, y, 110, ROW_H, "CLOSE (SEL)", false, C'180,60,0');
    y += ROW_H + PAD;
    Rect("SepSel2", x+5, y, PANEL_W-10, 1, C'80,80,80');
@@ -1691,29 +1809,48 @@ void UpdatePanelUI()
    }
 }
 
-void UpdatePartialLine(int x, int y)
+void UpdatePartialLine(int x, int &y)
 {
-   string nm = "PTL_Line";
+   ObjectDelete(0, g_prefix+"PTL_Line"); // Clean up old unnumbered label if present
+
    if(ui.partialsCount <= 0 || ui.tpPoints <= 0)
    {
-      Lbl(nm, x+10, y, "No partials configured");
-      ObjectSetInteger(0, g_prefix+nm, OBJPROP_FONTSIZE, 8);
-      ObjectSetInteger(0, g_prefix+nm, OBJPROP_COLOR, C'140,140,140');
+      Lbl("PTL_Line_0", x+10, y, "No partials configured");
+      ObjectSetInteger(0, g_prefix+"PTL_Line_0", OBJPROP_FONTSIZE, 8);
+      ObjectSetInteger(0, g_prefix+"PTL_Line_0", OBJPROP_COLOR, C'140,140,140');
+      for(int j=1; j<20; j++) ObjectDelete(0, g_prefix+"PTL_Line_"+IntegerToString(j)); // Clear extra lines
+      y += 18;
       return;
    }
 
    double step = (double)ui.tpPoints / (ui.partialsCount + 1);
    string txt = "";
+   int lineIdx = 0;
+
+   // Group partials into lines of 4 to prevent horizontal overflow
    for(int i = 1; i <= ui.partialsCount; i++)
    {
       int pts = (int)MathRound(step * i);
       txt += "TP" + IntegerToString(i) + ":" + IntegerToString(pts/10);
-      if(i < ui.partialsCount) txt += " | ";
+      
+      if(i % 4 == 0 || i == ui.partialsCount)
+      {
+         string nm = "PTL_Line_" + IntegerToString(lineIdx);
+         Lbl(nm, x+10, y, txt);
+         ObjectSetInteger(0, g_prefix+nm, OBJPROP_FONTSIZE, 8);
+         ObjectSetInteger(0, g_prefix+nm, OBJPROP_COLOR, C'140,140,140');
+         y += 14; 
+         lineIdx++;
+         txt = "";
+      }
+      else
+      {
+         txt += " | ";
+      }
    }
-
-   Lbl(nm, x+10, y, txt);
-   ObjectSetInteger(0, g_prefix+nm, OBJPROP_FONTSIZE, 8);
-   ObjectSetInteger(0, g_prefix+nm, OBJPROP_COLOR, C'140,140,140');
+   
+   y += 4; 
+   for(int j=lineIdx; j<20; j++) ObjectDelete(0, g_prefix+"PTL_Line_"+IntegerToString(j));
 }
 
 void UpdateSLTPPrices(double ep)
