@@ -29,9 +29,10 @@ input int      InpTrailingStart     = 150;
 input int      InpTrailingStep      = 50;
 
 input group "Drawdown Entries"
-input bool     InpUseDDEntries  = true;
-input int      InpDDPoints      = 200;
-input int      InpMaxDDEntries  = 2;
+input bool     InpUseDDEntries          = true;
+input int      InpDDPoints              = 200;
+input int      InpMaxDDEntries          = 2;
+input bool     InpExitBatchAtCombinedBE = false; // NEW: Close 3-order batches at combined BE
 
 #define PKT_TICK         1
 #define PKT_TRADE        2
@@ -142,6 +143,9 @@ struct DDBasket {
    int    PositionType;
    double LotSize;
    int    DDCount;
+   bool   RecoveryMode;
+   ulong  RecoveryTicket;
+   bool   LimitDDsPlaced;
 };
 
 struct TradeResultPacket {
@@ -223,6 +227,8 @@ void OnTick() {
    ManageTrailingStop();
    CheckDrawdownEntries();
    ManageWorstEntryBreakEven();
+   CheckCombinedBreakEven(); // NEW: Batch Eject Button
+   ManageRecoveryMode(); 
 
    uint now = GetTickCount();
    if((now - g_lastTick) < 50) return;
@@ -239,6 +245,8 @@ void OnTimer() {
    ManageTrailingStop();
    CheckDrawdownEntries();
    ManageWorstEntryBreakEven();
+   CheckCombinedBreakEven(); // NEW: Batch Eject Button
+   ManageRecoveryMode();
    ProcessPipe();
 }
 
@@ -498,6 +506,8 @@ void CloseAllPositions() {
          }
       }
    }
+   CancelLimitOrder(0); 
+   RemoveAllLines();    
 }
 
 bool IsMarketOpen() {
@@ -649,12 +659,11 @@ void PlaceLimitOrder(const CommandPacket &cmd) {
    double slPrice    = 0;
    double tpPrice    = 0;
    double lotSize    = (cmd.LotSize > 0) ? cmd.LotSize : g_lotSize;
-   int direction     = cmd.OrderDirection; // 0 = BUY, 1 = SELL
+   int direction     = cmd.OrderDirection; 
 
    int slPts = (cmd.SL > 0) ? cmd.SL : g_sl;
    int tpPts = (cmd.TotalTP > 0) ? cmd.TotalTP : g_totalTP;
 
-   // 1. Check if preview lines exist (e.g. preview mode or dragged lines)
    if(g_previewActive && ObjectFind(0, "AIV_PRV_ENTRY") >= 0) {
       limitPrice = NormalizeDouble(ObjectGetDouble(0, "AIV_PRV_ENTRY", OBJPROP_PRICE), _Digits);
       slPrice    = NormalizeDouble(ObjectGetDouble(0, "AIV_PRV_SL", OBJPROP_PRICE), _Digits);
@@ -663,34 +672,20 @@ void PlaceLimitOrder(const CommandPacket &cmd) {
       direction  = g_previewDirection;
       CancelPreview();
    } 
-   // 2. Fall back to direct parameters passed in CommandPacket
    else {
       limitPrice = NormalizeDouble(cmd.LimitPrice, _Digits);
       double dir = (direction == 0) ? 1.0 : -1.0;
-
-      if(limitPrice <= 0) {
-         WriteLog("Place Limit failed: Invalid LimitPrice = 0");
-         return;
-      }
-
+      if(limitPrice <= 0) return;
       slPrice = (slPts > 0) ? NormalizeDouble(limitPrice - dir * slPts * _Point, _Digits) : 0;
       tpPrice = (tpPts > 0) ? NormalizeDouble(limitPrice + dir * tpPts * _Point, _Digits) : 0;
    }
 
-   if(limitPrice <= 0 || lotSize <= 0) {
-      WriteLog("Place Limit failed: Price or LotSize invalid");
-      return;
-   }
+   if(limitPrice <= 0 || lotSize <= 0) return;
 
-   // Determine Limit vs Stop order type dynamically based on current market rates
    ENUM_ORDER_TYPE orderType;
-   if(direction == 0) {
-      orderType = (limitPrice < g_sym.Ask()) ? ORDER_TYPE_BUY_LIMIT : ORDER_TYPE_BUY_STOP;
-   } else {
-      orderType = (limitPrice > g_sym.Bid()) ? ORDER_TYPE_SELL_LIMIT : ORDER_TYPE_SELL_STOP;
-   }
+   if(direction == 0) orderType = (limitPrice < g_sym.Ask()) ? ORDER_TYPE_BUY_LIMIT : ORDER_TYPE_BUY_STOP;
+   else               orderType = (limitPrice > g_sym.Bid()) ? ORDER_TYPE_SELL_LIMIT : ORDER_TYPE_SELL_STOP;
 
-   // Resolve valid filling mode for symbol
    uint filling = (uint)SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
    ENUM_ORDER_TYPE_FILLING typeFilling = ORDER_FILLING_RETURN;
    if((filling & SYMBOL_FILLING_IOC) != 0) typeFilling = ORDER_FILLING_IOC;
@@ -717,7 +712,6 @@ void PlaceLimitOrder(const CommandPacket &cmd) {
                " Lot=" + DoubleToString(lotSize, 2) + " @ " + DoubleToString(limitPrice, _Digits));
       DrawConfirmedLimitLines(res.order, limitPrice, slPrice, tpPrice, direction);
 
-      // --- PLACE DD LIMIT ORDERS ---
       if(InpUseDDEntries && InpMaxDDEntries > 0) {
           for(int i = 1; i <= InpMaxDDEntries; i++) {
               double p_dd = limitPrice + (direction == 0 ? -1.0 : 1.0) * (i * InpDDPoints * _Point);
@@ -738,7 +732,6 @@ void PlaceLimitOrder(const CommandPacket &cmd) {
               ddReq.magic        = InpMagicNumber;
               ddReq.type_filling = typeFilling;
               ddReq.type_time    = ORDER_TIME_GTC;
-              // Flag this limit order as DD linked to the main limit's ticket
               ddReq.comment      = "AIV_DD_" + IntegerToString(res.order);
               
               if(OrderSend(ddReq, ddRes) && (ddRes.retcode == TRADE_RETCODE_DONE || ddRes.retcode == TRADE_RETCODE_PLACED)) {
@@ -746,9 +739,140 @@ void PlaceLimitOrder(const CommandPacket &cmd) {
               }
           }
       }
-   } else {
-      WriteLog("LIMIT OrderSend failed [RetCode: " + IntegerToString(res.retcode) + 
-               " / Err: " + IntegerToString(GetLastError()) + "]: " + res.comment);
+   }
+}
+
+void CancelOrCloseBatchDDs(ulong mainTicket, ulong keepTicket) {
+   for(int i = OrdersTotal() - 1; i >= 0; i--) {
+      ulong t = OrderGetTicket(i);
+      if(t > 0 && t != keepTicket && t != mainTicket) {
+         string cmt = OrderGetString(ORDER_COMMENT);
+         if(StringFind(cmt, "AIV_DD_" + IntegerToString(mainTicket)) >= 0) CancelLimitOrder(t);
+      }
+   }
+   
+   for(int i = PositionsTotal() - 1; i >= 0; i--) {
+      CPositionInfo pos;
+      if(pos.SelectByIndex(i)) {
+         ulong t = pos.Ticket();
+         if(t != keepTicket && t != mainTicket) {
+            int pIdx = FindPartialIndex(t);
+            if(pIdx >= 0 && g_partials[pIdx].MainTicket == mainTicket) {
+               ClosePositionByTicket(t);
+            }
+         }
+      }
+   }
+}
+
+void CheckCombinedBreakEven() {
+   if(!InpExitBatchAtCombinedBE) return;
+
+   for(int b = ArraySize(g_ddBaskets) - 1; b >= 0; b--) {
+      ulong main = g_ddBaskets[b].MainTicket;
+      
+      // Look for a batch containing 3 or more open positions
+      if(CountOpenInBasket(main) >= 3) {
+         double totalVol = 0;
+         double weightedPrice = 0;
+         bool isBuy = (g_ddBaskets[b].PositionType == POSITION_TYPE_BUY);
+         
+         for(int i = 0; i < PositionsTotal(); i++) {
+            CPositionInfo p;
+            if(p.SelectByIndex(i)) {
+               ulong t = p.Ticket();
+               int pIdx = FindPartialIndex(t);
+               if(pIdx >= 0 && g_partials[pIdx].MainTicket == main) {
+                  totalVol += p.Volume();
+                  weightedPrice += p.PriceOpen() * p.Volume();
+               }
+            }
+         }
+         
+         if(totalVol > 0) {
+            double avgEntry = weightedPrice / totalVol;
+            double currentPrice = isBuy ? g_sym.Bid() : g_sym.Ask();
+            bool shouldCloseAll = false;
+            
+            // Check if current price crossed the combined average entry price
+            if(isBuy && currentPrice >= avgEntry) shouldCloseAll = true;
+            if(!isBuy && currentPrice <= avgEntry) shouldCloseAll = true;
+            
+            if(shouldCloseAll) {
+               WriteLog("Batch #" + IntegerToString(main) + " Reached Combined Break-Even! Ejecting all positions.");
+               
+               // Passing 0 as keepTicket closes ALL DD positions
+               CancelOrCloseBatchDDs(main, 0); 
+               ClosePositionByTicket(main);
+               
+               g_ddBaskets[b].DDCount = 999;
+               g_ddBaskets[b].RecoveryMode = false;
+            }
+         }
+      }
+   }
+}
+
+void ManageRecoveryMode() {
+   for(int i = ArraySize(g_ddBaskets) - 1; i >= 0; i--) {
+      if(!g_ddBaskets[i].RecoveryMode) continue;
+
+      ulong mainTicket = g_ddBaskets[i].MainTicket;
+      ulong safeTicket = g_ddBaskets[i].RecoveryTicket; 
+      
+      CPositionInfo mainPos;
+      if(!mainPos.SelectByTicket(mainTicket)) {
+         g_ddBaskets[i].RecoveryMode = false;
+         continue;
+      }
+
+      // 1. SURVIVOR SHIFT CHECK: Did our safe order die? (e.g. hit BE)
+      CPositionInfo safePos;
+      if(safeTicket > 0 && !safePos.SelectByTicket(safeTicket)) {
+         ulong newSafeTicket = 0;
+         // Find any active DD order to take the mantle
+         for(int j = 0; j < PositionsTotal(); j++) {
+            CPositionInfo p;
+            if(p.SelectByIndex(j)) {
+               ulong t = p.Ticket();
+               if(t != mainTicket) {
+                  int pIdx = FindPartialIndex(t);
+                  if(pIdx >= 0 && g_partials[pIdx].MainTicket == mainTicket) {
+                     newSafeTicket = t;
+                     break; 
+                  }
+               }
+            }
+         }
+         
+         if(newSafeTicket > 0) {
+            WriteLog("Recovery Order #" + IntegerToString(safeTicket) + " closed. Shifting Survivor Status to DD #" + IntegerToString(newSafeTicket));
+            g_ddBaskets[i].RecoveryTicket = newSafeTicket;
+            safeTicket = newSafeTicket;
+         } else {
+            // No DDs left alive, abandon recovery mode
+            g_ddBaskets[i].RecoveryMode = false;
+            continue;
+         }
+      }
+
+      // 2. STANDARD RECOVERY LOGIC: Has price crossed Main Entry?
+      double currentPrice = (g_ddBaskets[i].PositionType == POSITION_TYPE_BUY) ? g_sym.Bid() : g_sym.Ask();
+      double mainEntry = g_ddBaskets[i].MainEntry;
+      
+      bool shouldClose = false;
+      if(g_ddBaskets[i].PositionType == POSITION_TYPE_BUY && currentPrice >= mainEntry) shouldClose = true;
+      if(g_ddBaskets[i].PositionType == POSITION_TYPE_SELL && currentPrice <= mainEntry) shouldClose = true;
+
+      if(shouldClose) {
+         WriteLog("Recovery Phase Resolved (Batch #" + IntegerToString(mainTicket) + "): Price crossed Main Entry. Closing Main.");
+         
+         g_ddBaskets[i].DDCount = 999; 
+         g_ddBaskets[i].RecoveryMode = false;
+         
+         ClosePositionByTicket(mainTicket);
+         CancelOrCloseBatchDDs(mainTicket, safeTicket); 
+      }
    }
 }
 
@@ -781,20 +905,18 @@ void CancelPreview() {
 
 void CancelLimitOrder(ulong ticket) {
    if(ticket > 0) {
-      if(g_trade.OrderDelete(ticket)) {
-         ObjectDelete(0, "AIV_LMT_" + IntegerToString(ticket) + "_E");
-         ObjectDelete(0, "AIV_LMT_" + IntegerToString(ticket) + "_S");
-         ObjectDelete(0, "AIV_LMT_" + IntegerToString(ticket) + "_T");
-      }
+      g_trade.OrderDelete(ticket); 
+      ObjectDelete(0, "AIV_LMT_" + IntegerToString(ticket) + "_E");
+      ObjectDelete(0, "AIV_LMT_" + IntegerToString(ticket) + "_S");
+      ObjectDelete(0, "AIV_LMT_" + IntegerToString(ticket) + "_T");
    } else {
       for(int i = OrdersTotal() - 1; i >= 0; i--) {
          ulong t = OrderGetTicket(i);
          if(t > 0 && OrderGetInteger(ORDER_MAGIC) == InpMagicNumber) {
-            if(g_trade.OrderDelete(t)) {
-               ObjectDelete(0, "AIV_LMT_" + IntegerToString(t) + "_E");
-               ObjectDelete(0, "AIV_LMT_" + IntegerToString(t) + "_S");
-               ObjectDelete(0, "AIV_LMT_" + IntegerToString(t) + "_T");
-            }
+            g_trade.OrderDelete(t);
+            ObjectDelete(0, "AIV_LMT_" + IntegerToString(t) + "_E");
+            ObjectDelete(0, "AIV_LMT_" + IntegerToString(t) + "_S");
+            ObjectDelete(0, "AIV_LMT_" + IntegerToString(t) + "_T");
          }
       }
    }
@@ -846,6 +968,9 @@ void RegisterDDBasket(ulong ticket, int posType, double entryPrice, double volum
    g_ddBaskets[size].PositionType = posType;
    g_ddBaskets[size].LotSize = volume;
    g_ddBaskets[size].DDCount = 0;
+   g_ddBaskets[size].RecoveryMode = false;
+   g_ddBaskets[size].RecoveryTicket = 0;
+   g_ddBaskets[size].LimitDDsPlaced = false;
 }
 
 void UnregisterDDBasket(ulong mainTicket) {
@@ -918,7 +1043,8 @@ void ManageWorstEntryBreakEven() {
 
    for(int b = ArraySize(g_ddBaskets) - 1; b >= 0; b--) {
       ulong main = g_ddBaskets[b].MainTicket;
-      if(g_ddBaskets[b].DDCount < 1 && CountOpenInBasket(main) < 2) continue;
+      
+      if(CountOpenInBasket(main) < 2) continue;
 
       int worst = FindWorstPartialIndex(main);
       if(worst < 0) continue;
@@ -942,6 +1068,7 @@ void CheckDrawdownEntries() {
    if(!IsMarketOpen()) return;
 
    for(int i = ArraySize(g_ddBaskets) - 1; i >= 0; i--) {
+      if(g_ddBaskets[i].LimitDDsPlaced) continue;
       if(g_ddBaskets[i].DDCount >= InpMaxDDEntries) continue;
 
       CPositionInfo mainPos;
@@ -988,7 +1115,6 @@ void ExecuteDDEntry(int basketIdx) {
    if(!isBuy && slPrice <= entry) return;
 
    g_openingDD = true;
-   // Add linking ticket reference into dynamic market orders as well
    string ddCmt = "AIV_DD_" + IntegerToString(g_ddBaskets[basketIdx].MainTicket);
    bool ok = isBuy
              ? g_trade.Buy(lot, _Symbol, entry, slPrice, tpPrice, ddCmt)
@@ -1052,6 +1178,21 @@ void CheckPartials() {
                if(g_beAfterLevel > 0 && nextPartial == g_beAfterLevel && !ps.BESet) {
                   if(pos.SelectByTicket(ps.Ticket)) ApplyBreakEven(i);
                }
+
+               if(nextPartial == 1) {
+                  int bIdx = FindDDBasketIndex(ps.MainTicket);
+                  if(bIdx >= 0) {
+                     if(!ps.IsDD) {
+                        WriteLog("Batch #" + IntegerToString(ps.MainTicket) + " hit TP1 on Main Order. Canceling remaining DDs.");
+                        g_ddBaskets[bIdx].DDCount = 999; 
+                        CancelOrCloseBatchDDs(ps.MainTicket, ps.Ticket);
+                     } else {
+                        WriteLog("Batch #" + IntegerToString(ps.MainTicket) + " hit TP1 on DD #" + IntegerToString(ps.Ticket) + ". Entering Recovery Mode.");
+                        g_ddBaskets[bIdx].RecoveryMode = true;
+                        g_ddBaskets[bIdx].RecoveryTicket = ps.Ticket;
+                     }
+                  }
+               }
             }
          }
       }
@@ -1091,6 +1232,14 @@ void ManualPartialClose(ulong ticket, double pct) {
 }
 
 void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest &request, const MqlTradeResult &result) {
+   if(trans.type == TRADE_TRANSACTION_ORDER_DELETE) {
+      ulong orderTicket = trans.order;
+      ObjectDelete(0, "AIV_LMT_" + IntegerToString(orderTicket) + "_E");
+      ObjectDelete(0, "AIV_LMT_" + IntegerToString(orderTicket) + "_S");
+      ObjectDelete(0, "AIV_LMT_" + IntegerToString(orderTicket) + "_T");
+      ChartRedraw(0);
+   }
+
    if(trans.type != TRADE_TRANSACTION_DEAL_ADD) return;
    ulong dealTicket = trans.deal;
    if(dealTicket == 0 || !HistoryDealSelect(dealTicket)) return;
@@ -1109,7 +1258,6 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
          bool isDD = (StringFind(cmt, "AIV_DD") >= 0);
          ulong mainTicket = posTicket;
 
-         // Extract main limit ticket reference for DD orders to link them to the correct basket
          if(isDD && StringFind(cmt, "AIV_DD_") == 0) {
              string tkStr = StringSubstr(cmt, 7);
              if(StringLen(tkStr) > 0) mainTicket = (ulong)StringToInteger(tkStr);
@@ -1118,20 +1266,16 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
          RegisterPosition(posTicket, posType, fillPrice, fillVol, isDD, mainTicket);
          DrawPartialLines(posTicket, posType, fillPrice, 0);
 
-         // Avoid dynamic DD from firing for main limit orders that already pre-placed their DDs
          if(!isDD) {
              RegisterDDBasket(posTicket, posType, fillPrice, fillVol);
              if(StringFind(cmt, "AIV_LMT") >= 0) {
                  int bIdx = FindDDBasketIndex(posTicket);
-                 if(bIdx >= 0) g_ddBaskets[bIdx].DDCount = InpMaxDDEntries; 
+                 if(bIdx >= 0) g_ddBaskets[bIdx].LimitDDsPlaced = true; 
              }
+         } else {
+             int bIdx = FindDDBasketIndex(mainTicket);
+             if(bIdx >= 0) g_ddBaskets[bIdx].DDCount++;
          }
-
-         string prefix = "AIV_LMT_" + IntegerToString(posTicket);
-         ObjectDelete(0, prefix + "_E");
-         ObjectDelete(0, prefix + "_S");
-         ObjectDelete(0, prefix + "_T");
-         ChartRedraw(0);
       }
       return;
    }
