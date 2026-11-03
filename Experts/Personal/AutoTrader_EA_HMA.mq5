@@ -2,7 +2,7 @@
 //|                                        smooth_custom_ma_EA.mq5   |
 //|  HTF smoothed MA (drawn on chart) + inflection lines +           |
 //|  pending-limit trading with cancel / BE / trail / partials       |
-//|  Production release V1.0                                         |
+//|  V1.1: partial spacing, profit target, cooldown, DD entries      |
 //|                                                                  |
 //|  Upper line -> SELL LIMIT at the line price                      |
 //|  Lower line -> BUY  LIMIT at the line price                      |
@@ -11,7 +11,7 @@
 //|  every tick.                                                     |
 //+------------------------------------------------------------------+
 #property copyright "smooth_custom_ma EA"
-#property version   "1.00"
+#property version   "1.11"
 #property description "HTF MA inflection-line limit-order EA"
 
 #include <Trade\Trade.mqh>
@@ -28,6 +28,11 @@ enum ENUM_CUSTOM_MA {
    CMA_RMA=2,
    CMA_WMA=3,
    CMA_HMA=4
+};
+
+enum ENUM_DD_SL {
+   DDSL_SAME_PRICE    = 0,   // Same SL price as the first order
+   DDSL_SAME_DISTANCE = 1    // Same SL distance (points) from the DD entry
 };
 
 input group "=== Base MA Settings ==="
@@ -71,8 +76,21 @@ input group "=== Position Management ==="
 input int    InpBEPoints            = 200;
 input int    InpTrailStartPoints    = 1000;
 input int    InpTrailDistancePoints = 200;
-input int    InpPartials            = 2;      // Tranches: milestones at k*TP/N, k=1..N-1 (2 = one at TP/2)
-input double InpPartialPercent      = 10.0;   // % of INITIAL volume closed per milestone
+input int    InpPartials            = 6;      // Number of partials; spacing = TP/(N+1) (TP 1400, N=6 -> every 200)
+input double InpPartialPercent      = 10.0;   // % of INITIAL volume closed per partial
+
+input group "=== Profit Target ==="
+input double InpProfitTargetUSD     = 500.0;  // Close ALL when floating profit >= this (0 = off)
+
+input group "=== Cooldown ==="
+input int    InpCooldownMinutes     = 15;     // Pause NEW line orders after any trade closes (0 = off)
+input bool   InpCooldownBlocksDD    = false;  // Also pause DD entries during cooldown
+
+input group "=== Drawdown (DD) Entries ==="
+input int        InpMaxDDEntries        = 2;                 // DD entries per first order (0 = off)
+input int        InpDDStepPoints        = 200;               // Adverse move between DD entries
+input ENUM_DD_SL InpDDSLMode            = DDSL_SAME_PRICE;
+input int        InpCloseWorstMinOrders = 3;                 // Same-direction orders that arm "close worst when green" (0 = off)
 
 //--- lines (rebuilt on every new chart bar)
 struct SLine {
@@ -101,6 +119,9 @@ struct SPosState {
    int    partials;
    bool   beDone;
    bool   trailStarted;
+   int    ddOpened;
+   bool   volWarned;
+   datetime partialRetry;
 };
 SPosState g_ps[];
 
@@ -113,6 +134,10 @@ int             g_basePeriod   = 1;
 int             g_smoothPeriod = 1;
 bool            g_drawVisuals  = false;
 datetime        g_lastBar = 0;
+datetime        g_cooldownUntil = 0;
+datetime        g_ddRetry[2];
+bool            g_greenMode[2];
+bool            g_ddEnabled = true;
 
 void DrawLines(const datetime anchor);
 void DrawMA(const MqlRates &cr[], const double &ma[], const int n);
@@ -569,6 +594,8 @@ bool LineTouchedNow(const int j)
 
 void PlaceOrders()
 {
+   if(TimeCurrent() < g_cooldownUntil) return;   // cooldown after a trade closed
+
    int pending = CountPendingOwned();
    if(pending >= InpMaxPending) return;
 
@@ -628,9 +655,25 @@ void PlaceOrders()
    }
 }
 
+// Deletes an EA pending order and re-arms its line so the order can be
+// placed again if price returns before the line is mitigated.
+bool DeleteOwnedOrder(const ulong tk)
+{
+   if(!OrderSelect(tk)) return false;
+   const string cmt = OrderGetString(ORDER_COMMENT);   // read before deleting
+   if(!TradeOk(g_trade.OrderDelete(tk))) {
+      LogFail("OrderDelete #" + IntegerToString((long)tk));
+      return false;
+   }
+   const int ri = FindRec(cmt);
+   if(ri >= 0) {
+      g_recs[ri].sent = false;
+      g_recs[ri].nextTry = 0;
+   }
+   return true;
+}
+
 // Deletes a pending order once the market has moved away from it.
-// The line's "sent" flag is reset so the order can be re-placed if price
-// returns to the level before the inflection line is mitigated.
 void CancelFarOrders()
 {
    const double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
@@ -651,24 +694,36 @@ void CancelFarOrders()
       if(ot == ORDER_TYPE_SELL_LIMIT && ask <= op - away - 1e-9) del = true;
       if(ot == ORDER_TYPE_BUY_LIMIT  && bid >= op + away + 1e-9) del = true;
 
-      if(del) {
-         const string cmt = OrderGetString(ORDER_COMMENT);   // read before deleting
-         if(TradeOk(g_trade.OrderDelete(tk))) {
-            // Re-arm the line: it may place a new order when price returns
-            // within proximity, until the inflection line is mitigated.
-            const int ri = FindRec(cmt);
-            if(ri >= 0) {
-               g_recs[ri].sent = false;
-               g_recs[ri].nextTry = 0;
-            }
-         } else LogFail("OrderDelete #" + IntegerToString((long)tk));
-      }
+      if(del) DeleteOwnedOrder(tk);
    }
 }
 
 //+------------------------------------------------------------------+
 //| Open position management                                          |
 //+------------------------------------------------------------------+
+void StartCooldown()
+{
+   if(InpCooldownMinutes > 0)
+      g_cooldownUntil = TimeCurrent() + (datetime)(InpCooldownMinutes * 60);
+}
+
+// Number of open DD entries that belong to the given first-order ticket
+int CountDDFor(const ulong anchor)
+{
+   int c = 0;
+   const string suffix = "_" + IntegerToString((long)anchor);
+   for(int i = PositionsTotal() - 1; i >= 0; i--) {
+      const ulong tk = PositionGetTicket(i);
+      if(tk == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+      const string cm = PositionGetString(POSITION_COMMENT);
+      if(StringFind(cm, "HTF_DD") != 0) continue;
+      if(StringFind(cm, suffix) > 0) c++;
+   }
+   return c;
+}
+
 int FindState(const ulong ticket)
 {
    for(int i = 0; i < ArraySize(g_ps); i++)
@@ -695,6 +750,10 @@ int EnsureState(const ulong ticket)
    const double tp = PositionGetDouble(POSITION_TP);
    g_ps[i].beDone = (sl > 0.0 && (g_ps[i].isBuy ? sl >= g_ps[i].entry - 1e-9 : sl <= g_ps[i].entry + 1e-9));
    g_ps[i].trailStarted = (tp == 0.0);
+   g_ps[i].volWarned = false;
+   g_ps[i].partialRetry = 0;
+   g_ps[i].ddOpened = 0;
+   g_ps[i].ddOpened = CountDDFor(ticket);
    return i;
 }
 
@@ -702,9 +761,57 @@ void CleanupStates()
 {
    for(int i = ArraySize(g_ps) - 1; i >= 0; i--) {
       if(!PositionSelectByTicket(g_ps[i].ticket)) {
+         StartCooldown();   // a tracked trade closed (win or lose)
          const int last = ArraySize(g_ps) - 1;
          if(i != last) g_ps[i] = g_ps[last];
          ArrayResize(g_ps, last);
+      }
+   }
+}
+
+// Takes EVERY partial that is due at the current price (catches up after gaps).
+// Partials are independent of break-even / trailing and run for every trade.
+void TakePartials(const int si, const ulong ticket, const double profitPts)
+{
+   if(InpPartials < 1 || InpPartialPercent <= 0.0 || InpTPPoints <= 0) return;
+   if(TimeCurrent() < g_ps[si].partialRetry) return;
+
+   const double vmin = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   int guard = 0;
+   while(g_ps[si].partials < InpPartials && guard++ < InpPartials) {
+      // N partials, evenly spaced TP/(N+1) apart; the remainder runs to the full TP
+      const double milestone = (double)InpTPPoints * (g_ps[si].partials + 1) / (double)(InpPartials + 1);
+      if(profitPts < milestone) return;
+
+      if(!PositionSelectByTicket(ticket)) return;
+      const double curVol = PositionGetDouble(POSITION_VOLUME);
+      const double raw    = g_ps[si].vol0 * InpPartialPercent / 100.0;
+      double piece        = RoundVolDown(raw);
+      if(piece <= 0.0) {
+         piece = vmin;   // configured % is below the broker's minimum lot: use the minimum lot
+         if(!g_ps[si].volWarned) {
+            PrintFormat("Partial %.1f%% of %.2f = %.4f is below min lot %.2f; using min lot for partials.",
+                        InpPartialPercent, g_ps[si].vol0, raw, vmin);
+            g_ps[si].volWarned = true;
+         }
+      }
+      if(curVol - piece < vmin - 1e-12) {
+         if(!g_ps[si].volWarned) {
+            PrintFormat("Partial skipped on #%I64u: closing %.2f would leave less than min lot (vol %.2f).", ticket, piece, curVol);
+            g_ps[si].volWarned = true;
+         }
+         return;
+      }
+
+      g_trade.SetTypeFillingBySymbol(_Symbol);
+      if(TradeOk(g_trade.PositionClosePartial(ticket, piece))) {
+         g_ps[si].partials++;
+         PrintFormat("Partial %d/%d on #%I64u: closed %.2f lots at +%.0f pts.",
+                     g_ps[si].partials, InpPartials, ticket, piece, profitPts);
+      } else {
+         LogFail("Partial close #" + IntegerToString((long)ticket));
+         g_ps[si].partialRetry = TimeCurrent() + 5;
+         return;
       }
    }
 }
@@ -724,12 +831,16 @@ void ManageOnePosition(const ulong ticket)
    const double md    = MinStopDist();
    const double profitPts = (isBuy ? (bid - entry) : (entry - ask)) / _Point;
 
+   g_trade.SetTypeFillingBySymbol(_Symbol);
+
+   //--- 1) Partial closes first, so a partial is never skipped by BE/trailing
+   TakePartials(si, ticket, profitPts);
+
+   if(!PositionSelectByTicket(ticket)) return;   // re-read after partials
    double sl = PositionGetDouble(POSITION_SL);
    double tp = PositionGetDouble(POSITION_TP);
 
-   g_trade.SetTypeFillingBySymbol(_Symbol);
-
-   //--- 1) Break-even
+   //--- 2) Break-even
    if(!g_ps[si].trailStarted && !g_ps[si].beDone && profitPts >= InpBEPoints) {
       const double newSL = NormalizeToTick(entry);
       const bool already = (sl > 0.0 && (isBuy ? sl >= newSL - 1e-9 : sl <= newSL + 1e-9));
@@ -746,7 +857,7 @@ void ManageOnePosition(const ulong ticket)
       }
    }
 
-   //--- 2) Trailing (and removal of the original TP)
+   //--- 3) Trailing (and removal of the original TP)
    if(g_ps[si].trailStarted || profitPts >= InpTrailStartPoints) {
       const double prop = NormalizeToTick(isBuy ? bid - InpTrailDistancePoints * _Point
                                                 : ask + InpTrailDistancePoints * _Point);
@@ -755,39 +866,17 @@ void ManageOnePosition(const ulong ticket)
       const bool distOk = isBuy ? (bid - prop > md) : (prop - ask > md);
 
       if(improves && distOk) {
-         if(TradeOk(g_trade.PositionModify(ticket, prop, 0.0))) {
+         if(TradeOk(g_trade.PositionModify(ticket, prop, 0.0)))
             g_ps[si].trailStarted = true;
-            return;   // trailing started/advanced: skip partials this tick
-         } else LogFail("Trail #" + IntegerToString((long)ticket));
+         else LogFail("Trail #" + IntegerToString((long)ticket));
       }
       else if(!g_ps[si].trailStarted && tp != 0.0) {
          // SL cannot improve; still remove the full TP
-         if(TradeOk(g_trade.PositionModify(ticket, sl, 0.0))) {
+         if(TradeOk(g_trade.PositionModify(ticket, sl, 0.0)))
             g_ps[si].trailStarted = true;
-            return;
-         } else LogFail("Remove TP #" + IntegerToString((long)ticket));
+         else LogFail("Remove TP #" + IntegerToString((long)ticket));
       }
    }
-
-   //--- 3) Partial closes (only before trailing starts)
-   if(g_ps[si].trailStarted) return;
-   if(InpPartials < 2 || InpPartialPercent <= 0.0 || InpTPPoints <= 0) return;
-   if(g_ps[si].partials >= InpPartials - 1) return;
-
-   const double milestone = (double)InpTPPoints * (g_ps[si].partials + 1) / (double)InpPartials;
-   if(profitPts < milestone) return;
-
-   if(!PositionSelectByTicket(ticket)) return;
-   const double curVol = PositionGetDouble(POSITION_VOLUME);
-   const double vmin   = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-   const double piece  = RoundVolDown(g_ps[si].vol0 * InpPartialPercent / 100.0);
-   if(piece <= 0.0) return;
-   if(curVol - piece < vmin - 1e-12) return;   // would leave less than minimum volume
-
-   if(TradeOk(g_trade.PositionClosePartial(ticket, piece)))
-      g_ps[si].partials++;
-   else
-      LogFail("Partial close #" + IntegerToString((long)ticket));
 }
 
 void ManagePositions()
@@ -803,6 +892,197 @@ void ManagePositions()
 }
 
 //+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| Profit target                                                     |
+//+------------------------------------------------------------------+
+struct SPosInfo {
+   ulong    ticket;
+   datetime time;
+   double   profit;   // profit + swap
+   bool     isDD;
+};
+
+int CollectOwned(const bool buy, SPosInfo &out[])
+{
+   ArrayResize(out, 0);
+   int c = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--) {
+      const ulong tk = PositionGetTicket(i);
+      if(tk == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+      const bool isBuy = ((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
+      if(isBuy != buy) continue;
+      ArrayResize(out, c + 1);
+      out[c].ticket = tk;
+      out[c].time   = (datetime)PositionGetInteger(POSITION_TIME);
+      out[c].profit = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+      out[c].isDD   = (StringFind(PositionGetString(POSITION_COMMENT), "HTF_DD") == 0);
+      c++;
+   }
+   return c;
+}
+
+double OwnedFloatingProfit()
+{
+   double p = 0.0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--) {
+      const ulong tk = PositionGetTicket(i);
+      if(tk == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+      p += PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+   }
+   return p;
+}
+
+void CloseAllOwned()
+{
+   g_trade.SetTypeFillingBySymbol(_Symbol);
+   for(int i = PositionsTotal() - 1; i >= 0; i--) {
+      const ulong tk = PositionGetTicket(i);
+      if(tk == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+      if(!TradeOk(g_trade.PositionClose(tk))) LogFail("Close #" + IntegerToString((long)tk));
+   }
+   for(int i = OrdersTotal() - 1; i >= 0; i--) {
+      const ulong tk = OrderGetTicket(i);
+      if(tk == 0) continue;
+      if(OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
+      if(OrderGetInteger(ORDER_MAGIC) != InpMagic) continue;
+      DeleteOwnedOrder(tk);
+   }
+}
+
+// Returns true if the target was hit and everything was closed this tick.
+bool CheckProfitTarget()
+{
+   if(InpProfitTargetUSD <= 0.0) return false;
+   const double p = OwnedFloatingProfit();
+   if(p < InpProfitTargetUSD) return false;
+
+   PrintFormat("Profit target reached (%.2f >= %.2f): closing all EA trades.", p, InpProfitTargetUSD);
+   CloseAllOwned();
+   StartCooldown();
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Drawdown (DD) entries                                             |
+//+------------------------------------------------------------------+
+void OpenDD(const int d, const int si, const int level)
+{
+   const bool buy = (d == 0);
+   const double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   const double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   if(ask <= 0.0 || bid <= 0.0) return;
+   const double md = MinStopDist();
+   const double price = buy ? ask : bid;
+   const double anchorEntry = g_ps[si].entry;
+
+   double sl = 0.0, tp = 0.0;
+   if(InpSLPoints > 0) {
+      if(InpDDSLMode == DDSL_SAME_PRICE)
+         sl = buy ? anchorEntry - InpSLPoints * _Point : anchorEntry + InpSLPoints * _Point;
+      else
+         sl = buy ? price - InpSLPoints * _Point : price + InpSLPoints * _Point;
+      sl = NormalizeToTick(sl);
+      const bool distOk = buy ? (bid - sl > md) : (sl - ask > md);
+      if(!distOk) {
+         PrintFormat("DD entry skipped: SL %.5f too close to market (min stop distance).", sl);
+         g_ddRetry[d] = TimeCurrent() + 30;
+         return;
+      }
+   }
+   if(InpTPPoints > 0)
+      tp = NormalizeToTick(buy ? price + InpTPPoints * _Point : price - InpTPPoints * _Point);
+
+   const double vol = RoundVolDown(g_ps[si].vol0);   // same lot as the first order
+   if(vol <= 0.0) return;
+
+   const string cmt = "HTF_DD" + IntegerToString(level) + "_" + IntegerToString((long)g_ps[si].ticket);
+   g_trade.SetTypeFillingBySymbol(_Symbol);
+   const bool called = buy ? g_trade.Buy(vol, _Symbol, price, sl, tp, cmt)
+                           : g_trade.Sell(vol, _Symbol, price, sl, tp, cmt);
+   if(TradeOk(called))
+      g_ps[si].ddOpened = level;
+   else {
+      LogFail("DD entry " + cmt);
+      g_ddRetry[d] = TimeCurrent() + 30;
+   }
+}
+
+void ManageDD()
+{
+   if(!g_ddEnabled || InpMaxDDEntries < 1 || InpDDStepPoints < 1) return;
+   if(InpCooldownBlocksDD && TimeCurrent() < g_cooldownUntil) return;
+
+   const double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   const double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   if(ask <= 0.0 || bid <= 0.0) return;
+
+   for(int d = 0; d < 2; d++) {
+      const bool buy = (d == 0);
+      if(TimeCurrent() < g_ddRetry[d]) continue;
+
+      SPosInfo ps[];
+      const int cnt = CollectOwned(buy, ps);
+      if(cnt < 1) continue;
+
+      // first order = earliest non-DD position in this direction
+      int a = -1;
+      for(int k = 0; k < cnt; k++) {
+         if(ps[k].isDD) continue;
+         if(a < 0 || ps[k].time < ps[a].time || (ps[k].time == ps[a].time && ps[k].ticket < ps[a].ticket)) a = k;
+      }
+      if(a < 0) continue;
+
+      const int si = EnsureState(ps[a].ticket);
+      if(si < 0) continue;
+
+      const int next = g_ps[si].ddOpened + 1;
+      if(next > InpMaxDDEntries) continue;
+
+      const double adverse = (buy ? (g_ps[si].entry - bid) : (ask - g_ps[si].entry)) / _Point;
+      if(adverse < (double)next * InpDDStepPoints) continue;
+
+      OpenDD(d, si, next);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| With N same-direction orders: close the worst ones once green,    |
+//| keep the latest order running                                     |
+//+------------------------------------------------------------------+
+void ManageGreenClose()
+{
+   if(InpCloseWorstMinOrders < 2) return;
+   g_trade.SetTypeFillingBySymbol(_Symbol);
+
+   for(int d = 0; d < 2; d++) {
+      SPosInfo ps[];
+      const int cnt = CollectOwned(d == 0, ps);
+
+      if(cnt >= InpCloseWorstMinOrders) g_greenMode[d] = true;   // armed
+      if(cnt <= 1) g_greenMode[d] = false;                       // group finished
+      if(!g_greenMode[d] || cnt < 2) continue;
+
+      int latest = 0;
+      for(int k = 1; k < cnt; k++)
+         if(ps[k].time > ps[latest].time || (ps[k].time == ps[latest].time && ps[k].ticket > ps[latest].ticket))
+            latest = k;
+
+      for(int k = 0; k < cnt; k++) {
+         if(k == latest) continue;
+         if(ps[k].profit > 0.0) {
+            if(!TradeOk(g_trade.PositionClose(ps[k].ticket)))
+               LogFail("Close green #" + IntegerToString((long)ps[k].ticket));
+         }
+      }
+   }
+}
+
 int OnInit()
 {
    if(InpBasePeriod < 1 || InpSmoothPeriod < 1 || InpPivotCandles < 1 || InpMaxBars < 100)
@@ -834,6 +1114,13 @@ int OnInit()
    ArrayResize(g_recs, 0);
    ArrayResize(g_ps, 0);
    g_lastBar = 0;
+   g_cooldownUntil = 0;
+   for(int d = 0; d < 2; d++) { g_ddRetry[d] = 0; g_greenMode[d] = false; }
+
+   const ENUM_ACCOUNT_MARGIN_MODE mm = (ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(ACCOUNT_MARGIN_MODE);
+   g_ddEnabled = (mm == ACCOUNT_MARGIN_MODE_RETAIL_HEDGING);
+   if(!g_ddEnabled && InpMaxDDEntries > 0)
+      Print("WARNING: DD entries need a HEDGING account (netting merges positions). DD entries are disabled.");
    return(INIT_SUCCEEDED);
 }
 
@@ -853,7 +1140,10 @@ void OnTick()
 
    //--- per-tick trade logic
    CancelFarOrders();
+   if(CheckProfitTarget()) return;
    ManagePositions();
+   ManageDD();
+   ManageGreenClose();
    PlaceOrders();
 }
 //+------------------------------------------------------------------+

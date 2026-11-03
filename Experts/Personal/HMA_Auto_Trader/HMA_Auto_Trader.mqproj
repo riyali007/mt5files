@@ -1,0 +1,43 @@
+﻿{
+  "platform"    :"mt5",
+  "program_type":"expert",
+  "copyright"   :"Riy Technologies AB",
+  "link"        :"https:\/\/www.riytechnologies.com",
+  "version"     :"1.00",
+  "cpu_architecture" :"0",
+  "optimize"    :"1",
+  "fpzerocheck" :"1",
+  "tester_no_cache":"0",
+  "tester_everytick_calculate":"0",
+  "unicode_character_set":"0",
+  "static_libraries":"0",
+
+  "files":
+  [
+    {
+      "path":"HMA_Auto_Trader.mq5",
+      "compile":true,
+      "relative_to_project":true
+    },
+    {
+      "path":"HAE_Defines.mqh",
+      "compile":false,
+      "relative_to_project":true
+    },
+    {
+      "path":"HAE_Symbol.mqh",
+      "compile":false,
+      "relative_to_project":true
+    },
+    {
+      "path":"HAE_MA.mqh",
+      "compile":false,
+      "relative_to_project":true
+    },
+    {
+      "path":"HAE_Lines.mqh",
+      "compile":false,
+      "relative_to_project":true
+    }
+  ]
+}

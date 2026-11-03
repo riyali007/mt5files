@@ -1,0 +1,98 @@
+﻿{
+  "platform"    :"mt5",
+  "program_type":"expert",
+  "copyright"   :"Riy Technologies AB",
+  "link"        :"https:\/\/www.riytechnologies.com",
+  "version"     :"1.00",
+  "cpu_architecture" :"0",
+  "optimize"    :"1",
+  "fpzerocheck" :"1",
+  "tester_no_cache":"0",
+  "tester_everytick_calculate":"0",
+  "unicode_character_set":"0",
+  "static_libraries":"0",
+
+  "files":
+  [
+    {
+      "path":"TradingPanel.mq5",
+      "compile":true,
+      "relative_to_project":true
+    },
+    {
+      "path":"Log.mqh",
+      "compile":false,
+      "relative_to_project":true
+    },
+    {
+      "path":"Config.mqh",
+      "compile":false,
+      "relative_to_project":true
+    },
+    {
+      "path":"State.mqh",
+      "compile":false,
+      "relative_to_project":true
+    },
+    {
+      "path":"Closer.mqh",
+      "compile":false,
+      "relative_to_project":true
+    },
+    {
+      "path":"Rules.mqh",
+      "compile":false,
+      "relative_to_project":true
+    },
+    {
+      "path":"Orders.mqh",
+      "compile":false,
+      "relative_to_project":true
+    },
+    {
+      "path":"Manual.mqh",
+      "compile":false,
+      "relative_to_project":true
+    },
+    {
+      "path":"Panel.mqh",
+      "compile":false,
+      "relative_to_project":true
+    },
+    {
+      "path":"MQL5\\Include\\Trade\\Trade.mqh",
+      "compile":false,
+      "relative_to_project":false
+    },
+    {
+      "path":"MQL5\\Include\\Object.mqh",
+      "compile":false,
+      "relative_to_project":false
+    },
+    {
+      "path":"MQL5\\Include\\StdLibErr.mqh",
+      "compile":false,
+      "relative_to_project":false
+    },
+    {
+      "path":"MQL5\\Include\\Trade\\OrderInfo.mqh",
+      "compile":false,
+      "relative_to_project":false
+    },
+    {
+      "path":"MQL5\\Include\\Trade\\HistoryOrderInfo.mqh",
+      "compile":false,
+      "relative_to_project":false
+    },
+    {
+      "path":"MQL5\\Include\\Trade\\PositionInfo.mqh",
+      "compile":false,
+      "relative_to_project":false
+    },
+    {
+      "path":"MQL5\\Include\\Trade\\DealInfo.mqh",
+      "compile":false,
+      "relative_to_project":false
+    }
+  ]
+}
