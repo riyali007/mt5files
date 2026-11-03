@@ -34,6 +34,13 @@ input int      InpDDPoints              = 200;
 input int      InpMaxDDEntries          = 2;
 input bool     InpExitBatchAtCombinedBE = false; // NEW: Close 3-order batches at combined BE
 
+input group "Survival Mode"
+input bool InpUseSurvivalMode     = true;  // Enable survival mode
+input int  InpSurvivalDDCount     = 2;     // Open DD entries that trigger it
+input int  InpSurvivalBEOffsetPts = 0;     // Points past avg entry (cover spread/commission)
+input bool InpSurvivalRemoveTP    = true;  // Remove TPs so price can return to BE
+input bool InpTrailRemoveTP = true;   // Remove full TP when trailing starts
+
 #define PKT_TICK         1
 #define PKT_TRADE        2
 #define PKT_POSITIONS    3
@@ -146,6 +153,7 @@ struct DDBasket {
    bool   RecoveryMode;
    ulong  RecoveryTicket;
    bool   LimitDDsPlaced;
+   bool   SurvivalMode;   // NEW
 };
 
 struct TradeResultPacket {
@@ -187,7 +195,73 @@ int    g_previewSL = 0;
 int    g_previewTP = 0;
 int    g_drawCounter = 0;
 bool   g_openingDD = false;
+bool IsSurvivalBasket(ulong mainTicket) {
+   int b = FindDDBasketIndex(mainTicket);
+   return (b >= 0 && g_ddBaskets[b].SurvivalMode);
+}
 
+int CountOpenDDsInBasket(ulong mainTicket) {
+   int n = 0;
+   for(int i = 0; i < ArraySize(g_partials); i++) {
+      if(!g_partials[i].IsDD || g_partials[i].MainTicket != mainTicket) continue;
+      CPositionInfo p;
+      if(p.SelectByTicket(g_partials[i].Ticket)) n++;
+   }
+   return n;
+}
+
+void ManageSurvivalMode() {
+   if(!InpUseSurvivalMode) return;
+
+   for(int b = ArraySize(g_ddBaskets) - 1; b >= 0; b--) {
+      ulong main = g_ddBaskets[b].MainTicket;
+      CPositionInfo mp;
+      if(!mp.SelectByTicket(main)) continue;
+
+      // 1. Activation (latches)
+      if(!g_ddBaskets[b].SurvivalMode) {
+         if(CountOpenDDsInBasket(main) < InpSurvivalDDCount) continue;
+
+         g_ddBaskets[b].SurvivalMode = true;
+         g_ddBaskets[b].RecoveryMode = false;
+         WriteLog("SURVIVAL MODE ON - Batch #" + IntegerToString(main) +
+                  ". Closing all at combined break-even.");
+
+         if(InpSurvivalRemoveTP) {
+            for(int i = 0; i < ArraySize(g_partials); i++) {
+               if(g_partials[i].MainTicket != main && g_partials[i].Ticket != main) continue;
+               CPositionInfo p;
+               if(p.SelectByTicket(g_partials[i].Ticket) && p.TakeProfit() > 0)
+                  g_trade.PositionModify(g_partials[i].Ticket, p.StopLoss(), 0);
+            }
+         }
+      }
+
+      // 2. Combined BE check
+      double totalVol = 0, weighted = 0;
+      for(int i = 0; i < ArraySize(g_partials); i++) {
+         if(g_partials[i].MainTicket != main && g_partials[i].Ticket != main) continue;
+         CPositionInfo p;
+         if(!p.SelectByTicket(g_partials[i].Ticket)) continue;
+         totalVol += p.Volume();
+         weighted += p.PriceOpen() * p.Volume();
+      }
+      if(totalVol <= 0) continue;
+
+      bool   isBuy    = (g_ddBaskets[b].PositionType == POSITION_TYPE_BUY);
+      double beLevel  = weighted / totalVol + (isBuy ? 1.0 : -1.0) * InpSurvivalBEOffsetPts * _Point;
+      double cur      = isBuy ? g_sym.Bid() : g_sym.Ask();
+      bool   hitBE    = isBuy ? (cur >= beLevel) : (cur <= beLevel);
+
+      if(hitBE) {
+         WriteLog("SURVIVAL: Batch #" + IntegerToString(main) + " at combined BE @ " +
+                  DoubleToString(beLevel, _Digits) + ". Closing all.");
+         g_ddBaskets[b].DDCount = 999;          // stop new DDs
+         CancelOrCloseBatchDDs(main, 0);        // cancel pending + close DDs
+         ClosePositionByTicket(main);           // close main (also unregisters basket)
+      }
+   }
+}
 int OnInit() {
    g_lotSize = InpLotSize;
    g_sl = InpSL;
@@ -223,6 +297,7 @@ void OnTick() {
    if(!inTester) return;
 
    g_sym.RefreshRates();
+   ManageSurvivalMode();   // NEW - runs before the other managers
    CheckPartials();
    ManageTrailingStop();
    CheckDrawdownEntries();
@@ -241,6 +316,7 @@ void OnTimer() {
    if(inTester) return;
 
    g_sym.RefreshRates();
+   ManageSurvivalMode();   // NEW - runs before the other managers
    CheckPartials();
    ManageTrailingStop();
    CheckDrawdownEntries();
@@ -263,26 +339,32 @@ void ManageTrailingStop() {
       ulong ticket = g_partials[i].Ticket;
       CPositionInfo pos;
       if(!pos.SelectByTicket(ticket)) continue;
+      if(IsSurvivalBasket(g_partials[i].MainTicket)) continue;   // survival mode owns this basket
 
-      double open = pos.PriceOpen();
-      double curSL = pos.StopLoss();
-      double curTP = pos.TakeProfit();
-      double pt = _Point;
-      bool isBuy = (pos.PositionType() == POSITION_TYPE_BUY);
+      double open   = pos.PriceOpen();
+      double curSL  = pos.StopLoss();
+      double curTP  = pos.TakeProfit();
+      double pt     = _Point;
+      bool   isBuy  = (pos.PositionType() == POSITION_TYPE_BUY);
 
-      if(isBuy) {
-         double bid = g_sym.Bid();
-         if(bid - open < InpTrailingStart * pt) continue;
-         double target = NormaliseSL(bid - InpTrailingStep * pt);
-         if(curSL <= 0 || target > curSL + pt)
-            g_trade.PositionModify(ticket, target, curTP);
-      } else {
-         double ask = g_sym.Ask();
-         if(open - ask < InpTrailingStart * pt) continue;
-         double target = NormaliseSL(ask + InpTrailingStep * pt);
-         if(curSL <= 0 || target < curSL - pt)
-            g_trade.PositionModify(ticket, target, curTP);
-      }
+      double price  = isBuy ? g_sym.Bid() : g_sym.Ask();
+      double moved  = isBuy ? (price - open) : (open - price);
+      if(moved < InpTrailingStart * pt) continue;                // trailing not started yet
+
+      // Trailing has started: drop the full TP (once)
+      double newTP = (InpTrailRemoveTP) ? 0.0 : curTP;
+      bool   removeTP = (InpTrailRemoveTP && curTP > 0);
+
+      double target = isBuy ? NormaliseSL(price - InpTrailingStep * pt)
+                            : NormaliseSL(price + InpTrailingStep * pt);
+      bool slBetter = isBuy ? (curSL <= 0 || target > curSL + pt)
+                            : (curSL <= 0 || target < curSL - pt);
+
+      if(!slBetter && !removeTP) continue;
+      double newSL = slBetter ? target : curSL;
+
+      if(g_trade.PositionModify(ticket, newSL, newTP) && removeTP)
+         WriteLog("Trailing started #" + IntegerToString(ticket) + " - full TP removed");
    }
 }
 
@@ -459,6 +541,7 @@ void ExecuteBuy() {
       DrawPartialLines(ticket, POSITION_TYPE_BUY, ask, slPrice);
       RegisterPosition(ticket, POSITION_TYPE_BUY, ask, g_lotSize, false, ticket);
       RegisterDDBasket(ticket, POSITION_TYPE_BUY, ask, g_lotSize);
+      
    } else {
       WriteLog("BUY failed [" + IntegerToString(g_trade.ResultRetcode()) + "]: " + g_trade.ResultComment());
    }
@@ -767,9 +850,11 @@ void CancelOrCloseBatchDDs(ulong mainTicket, ulong keepTicket) {
 
 void CheckCombinedBreakEven() {
    if(!InpExitBatchAtCombinedBE) return;
-
+   
+   
    for(int b = ArraySize(g_ddBaskets) - 1; b >= 0; b--) {
       ulong main = g_ddBaskets[b].MainTicket;
+      if(IsSurvivalBasket(main)) continue;
       
       // Look for a batch containing 3 or more open positions
       if(CountOpenInBasket(main) >= 3) {
@@ -815,6 +900,7 @@ void CheckCombinedBreakEven() {
 
 void ManageRecoveryMode() {
    for(int i = ArraySize(g_ddBaskets) - 1; i >= 0; i--) {
+      if(g_ddBaskets[i].SurvivalMode) continue;
       if(!g_ddBaskets[i].RecoveryMode) continue;
 
       ulong mainTicket = g_ddBaskets[i].MainTicket;
@@ -971,6 +1057,7 @@ void RegisterDDBasket(ulong ticket, int posType, double entryPrice, double volum
    g_ddBaskets[size].RecoveryMode = false;
    g_ddBaskets[size].RecoveryTicket = 0;
    g_ddBaskets[size].LimitDDsPlaced = false;
+   g_ddBaskets[size].SurvivalMode = false;
 }
 
 void UnregisterDDBasket(ulong mainTicket) {
@@ -1043,6 +1130,7 @@ void ManageWorstEntryBreakEven() {
 
    for(int b = ArraySize(g_ddBaskets) - 1; b >= 0; b--) {
       ulong main = g_ddBaskets[b].MainTicket;
+      if(IsSurvivalBasket(main)) continue;
       
       if(CountOpenInBasket(main) < 2) continue;
 
@@ -1148,6 +1236,7 @@ void CheckPartials() {
          if(!ps.IsDD) UnregisterDDBasket(ps.Ticket);
          continue;
       }
+      if(IsSurvivalBasket(ps.MainTicket)) continue;
 
       double currentPrice = (ps.PositionType == POSITION_TYPE_BUY) ? g_sym.Bid() : g_sym.Ask();
       double direction = (ps.PositionType == POSITION_TYPE_BUY) ? 1.0 : -1.0;
@@ -1359,6 +1448,10 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
       CPositionInfo pos;
       if(pos.SelectByTicket(ticket)) {
          if(level == g_tpLevels) {
+            if(InpUseTrailingStop && InpTrailRemoveTP && pos.TakeProfit() == 0) {
+               ObjectSetDouble(0, objName, OBJPROP_PRICE, ObjectGetDouble(0, objName, OBJPROP_PRICE)); // keep visual only
+               return;
+            }
             if(g_trade.PositionModify(ticket, pos.StopLoss(), newTP)) {
                int idx = FindPartialIndex(ticket);
                double entry = (idx >= 0) ? g_partials[idx].EntryPrice : pos.PriceOpen();
